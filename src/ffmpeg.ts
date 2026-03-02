@@ -79,14 +79,19 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
     const hasDri = isLinux && fs.existsSync("/dev/dri/renderD128");
 
     if (isLinux && encoders.includes("h264_vaapi") && hasDri) {
-      log("Hardware Acceleration: VAAPI detected! (Linux Preferred)");
+      log("Hardware Acceleration: VAAPI detected! Full GPU decode+encode pipeline.");
+      // Decode H264 directly on GPU via VAAPI so frames never leave GPU memory.
+      // This avoids the CPU-decode -> DMA-upload bottleneck that causes frame drops
+      // on virtual iGPUs where the upload path is too slow for 50fps 1080p.
       return {
         preInput: [
-          "-init_hw_device", "vaapi=hw:/dev/dri/renderD128",
-          "-filter_hw_device", "hw",
+          "-hwaccel", "vaapi",
+          "-hwaccel_device", "/dev/dri/renderD128",
+          "-hwaccel_output_format", "vaapi",
         ],
         postInput: [
-          "-vf", "format=nv12,hwupload",
+          // frames are already in GPU memory — no upload needed
+          "-vf", "scale_vaapi=w=iw:h=ih:format=nv12",
           "-c:v", "h264_vaapi",
           "-profile:v", "constrained_baseline",
           "-level:v", "31",
@@ -174,12 +179,6 @@ const spawnFFmpeg = async (
     ...encoderArgs.postInput,
     ...qualityArgs,
     "-g", "50",
-    "-sc_threshold", "0",
-    // Normalize the huge epoch-based PCR timestamps from the source to start at 0
-    // Without this the RTP timestamp field overflows and the receiver freezes
-    "-copyts",
-    "-start_at_zero",
-    "-vsync", "cfr",
     "-payload_type", options.videoPayloadType.toString(),
     "-ssrc", options.videoSsrc.toString(),
     "-f", "rtp",
