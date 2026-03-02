@@ -3,9 +3,6 @@ import fs from "fs";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
 
-// a lot of vibes going on this file
-// i don't even know if this is efficient or the best way to do this, but it's kinda working
-
 type TOptions = {
   sourceUrl: string;
   gopSize: number;
@@ -27,22 +24,26 @@ type TProcessPair = {
   audioRtp?: ReturnType<typeof Bun.spawn> | null;
 };
 
+// preInput: args that MUST come before -i (hw device init)
+// postInput: args that come after -i (filters, codec, profile)
+type TEncoderArgs = {
+  preInput: string[];
+  postInput: string[];
+};
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Helper to determine which FFmpeg to use and whether to allow HW acceleration
 const getFFmpegSetup = (log: (...messages: unknown[]) => void): { binaryPath: string; allowHwAccel: boolean } => {
   try {
-    // 1. Check if system-wide FFmpeg is installed
     const proc = Bun.spawnSync(["ffmpeg", "-version"]);
     if (proc.success) {
       log("System-wide FFmpeg detected! Hardware acceleration checks enabled.");
       return { binaryPath: "ffmpeg", allowHwAccel: true };
     }
   } catch (err) {
-    // Ignore error, it just means it's not in the system PATH
+    // not in PATH
   }
 
-  // 2. Fallback to local binary
   let binaryName = "ffmpeg.exe";
   if (process.platform !== "win32") {
     binaryName = "ffmpeg";
@@ -51,18 +52,11 @@ const getFFmpegSetup = (log: (...messages: unknown[]) => void): { binaryPath: st
   const localPath = path.join(__dirname, "bin", binaryName);
   log(`System FFmpeg not found. Falling back to local binary at: ${localPath}`);
   log("Hardware acceleration disabled (Forcing CPU encoding for local binary).");
-
   return { binaryPath: localPath, allowHwAccel: false };
 };
 
-type TEncoderArgs = {
-  preInput: string[];   // args that must come BEFORE -i (hw device init)
-  postInput: string[];  // args that come AFTER -i (filters, codec, profile)
-};
-
-// Helper function to detect and return the best hardware acceleration arguments
+// Returns cleanly separated pre/post input encoder args
 const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...messages: unknown[]) => void): TEncoderArgs => {
-  // 1. The standard CPU fallback
   const cpuArgs: TEncoderArgs = {
     preInput: [],
     postInput: [
@@ -76,20 +70,14 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
     ],
   };
 
-  // If local binary is used, skip all hardware checks
-  if (!allowHwAccel) {
-    return cpuArgs;
-  }
+  if (!allowHwAccel) return cpuArgs;
 
   try {
-    // 2. Ask FFmpeg what encoders it supports
     const proc = Bun.spawnSync([binaryPath, "-encoders"]);
     const encoders = proc.stdout.toString();
-
     const isLinux = process.platform === "linux";
     const hasDri = isLinux && fs.existsSync("/dev/dri/renderD128");
 
-    // 3. Try VAAPI FIRST on Linux
     if (isLinux && encoders.includes("h264_vaapi") && hasDri) {
       log("Hardware Acceleration: VAAPI detected! (Linux Preferred)");
       return {
@@ -106,7 +94,6 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
       };
     }
 
-    // 4. Try Intel QuickSync (QSV)
     if (encoders.includes("h264_qsv") && (process.platform === "win32" || hasDri)) {
       log("Hardware Acceleration: Intel QuickSync (QSV) detected!");
       return {
@@ -127,7 +114,6 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
     log("Failed to detect hardware acceleration, falling back to CPU.");
   }
 
-  // 5. Fallback if no hardware is found
   log("Hardware Acceleration: None detected. Falling back to CPU (libx264).");
   return cpuArgs;
 };
@@ -136,11 +122,10 @@ const spawnFFmpeg = async (
   pluginPath: string,
   options: TOptions,
 ): Promise<TProcessPair> => {
-  
-  // Dynamically determine which FFmpeg to use
-  const { binaryPath, allowHwAccel } = getFFmpegSetup(options.log);
 
-  // Quality bitrate arguments
+  const { binaryPath, allowHwAccel } = getFFmpegSetup(options.log);
+  const encoderArgs = getEncoderArgs(binaryPath, allowHwAccel, options.log);
+
   let qualityArgs: string[] = [];
   switch (options.quality) {
     case "low":
@@ -158,14 +143,15 @@ const spawnFFmpeg = async (
       break;
   }
 
-  const encoderArgs = getEncoderArgs(binaryPath, allowHwAccel, options.log);
-
   const vaapiEnv = {
     ...process.env,
     LIBVA_DRIVER_NAME: "iHD",
     LIBVA_DRIVERS_PATH: "/usr/lib/x86_64-linux-gnu/dri",
   };
 
+  // use_wallclock_as_timestamps forces FFmpeg to regenerate monotonic timestamps
+  // from the system clock, fixing "non-monotonic DTS / backward in time" errors
+  // that are common with live IPTV streams that have PTS resets or discontinuities
   const commonInputArgs = [
     "-reconnect", "1",
     "-reconnect_streamed", "1",
@@ -173,6 +159,7 @@ const spawnFFmpeg = async (
     "-reconnect_delay_max", "5",
     "-timeout", "10000000",
     "-user_agent", "Mozilla/5.0",
+    "-use_wallclock_as_timestamps", "1",
     "-fflags", "+genpts+discardcorrupt",
     "-err_detect", "ignore_err",
   ];
@@ -180,11 +167,11 @@ const spawnFFmpeg = async (
   // Video: source -> hw encode -> RTP
   const videoRtpArgs = [
     ...commonInputArgs,
-    ...encoderArgs.preInput,       // hw device init (must be before -i)
+    ...encoderArgs.preInput,
     "-i", options.sourceUrl,
     "-map", "0:v:0",
     "-an",
-    ...encoderArgs.postInput,      // filter, codec, profile (cleanly separated)
+    ...encoderArgs.postInput,
     ...qualityArgs,
     "-g", "50",
     "-sc_threshold", "0",
@@ -195,12 +182,13 @@ const spawnFFmpeg = async (
   ];
 
   // Audio: source -> downmix -> opus -> RTP (direct, no HLS)
+  // asetpts=N/SR/TB resets audio timestamps from scratch after the pan filter
   const audioRtpArgs = [
     ...commonInputArgs,
     "-i", options.sourceUrl,
     "-map", "0:a:0",
     "-vn",
-    "-af", "pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE",
+    "-af", "pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE,asetpts=N/SR/TB",
     "-c:a", "libopus",
     "-ar", "48000",
     "-ac", "2",
@@ -237,77 +225,49 @@ const spawnFFmpeg = async (
   (async () => {
     const reader = videoRtpProcess.stdout.getReader();
     const decoder = new TextDecoder();
-
     try {
       while (true) {
         const { done, value } = await reader.read();
-
         if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Video RTP stdout]", text.trim());
+        options.log("[Video RTP stdout]", decoder.decode(value, { stream: true }).trim());
       }
-    } catch (error) {
-      options.error("[Video RTP stdout error]", error);
-    }
+    } catch (error) { options.error("[Video RTP stdout error]", error); }
   })();
 
   (async () => {
     const reader = videoRtpProcess.stderr.getReader();
     const decoder = new TextDecoder();
-
     try {
       while (true) {
         const { done, value } = await reader.read();
-
         if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Video RTP stderr]", text.trim());
+        options.log("[Video RTP stderr]", decoder.decode(value, { stream: true }).trim());
       }
-    } catch (error) {
-      options.error("[Video RTP stderr error]", error);
-    }
+    } catch (error) { options.error("[Video RTP stderr error]", error); }
   })();
 
   (async () => {
     const reader = audioRtpProcess.stdout.getReader();
     const decoder = new TextDecoder();
-
     try {
       while (true) {
         const { done, value } = await reader.read();
-
         if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Audio RTP stdout]", text.trim());
+        options.log("[Audio RTP stdout]", decoder.decode(value, { stream: true }).trim());
       }
-    } catch (error) {
-      options.error("[Audio RTP stdout error]", error);
-    }
+    } catch (error) { options.error("[Audio RTP stdout error]", error); }
   })();
 
   (async () => {
     const reader = audioRtpProcess.stderr.getReader();
     const decoder = new TextDecoder();
-
     try {
       while (true) {
         const { done, value } = await reader.read();
-
         if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Audio RTP stderr]", text.trim());
+        options.log("[Audio RTP stderr]", decoder.decode(value, { stream: true }).trim());
       }
-    } catch (error) {
-      options.error("[Audio RTP stderr error]", error);
-    }
+    } catch (error) { options.error("[Audio RTP stderr error]", error); }
   })();
 
   return {
@@ -317,13 +277,8 @@ const spawnFFmpeg = async (
 };
 
 const killFFmpegProcesses = (processes: TProcessPair): void => {
-  if (processes.videoRtp) {
-    processes.videoRtp.kill();
-  }
-
-  if (processes.audioRtp) {
-    processes.audioRtp.kill();
-  }
+  if (processes.videoRtp) processes.videoRtp.kill();
+  if (processes.audioRtp) processes.audioRtp.kill();
 };
 
 export { spawnFFmpeg, killFFmpegProcesses };
