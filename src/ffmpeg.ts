@@ -149,9 +149,7 @@ const spawnFFmpeg = async (
     LIBVA_DRIVERS_PATH: "/usr/lib/x86_64-linux-gnu/dri",
   };
 
-  // use_wallclock_as_timestamps forces FFmpeg to regenerate monotonic timestamps
-  // from the system clock, fixing "non-monotonic DTS / backward in time" errors
-  // that are common with live IPTV streams that have PTS resets or discontinuities
+  // Base input args shared by both processes
   const commonInputArgs = [
     "-reconnect", "1",
     "-reconnect_streamed", "1",
@@ -159,12 +157,16 @@ const spawnFFmpeg = async (
     "-reconnect_delay_max", "5",
     "-timeout", "10000000",
     "-user_agent", "Mozilla/5.0",
-    "-use_wallclock_as_timestamps", "1",
     "-fflags", "+genpts+discardcorrupt",
     "-err_detect", "ignore_err",
+    // Avoid excessive buffering on live streams so encoding starts promptly
+    "-max_delay", "500000",
+    "-avioflags", "direct",
   ];
 
   // Video: source -> hw encode -> RTP
+  // No wallclock timestamp rewriting — that causes massive frame drops on streams
+  // with large PCR values (FFmpeg enters catch-up mode trying to sync to wall clock)
   const videoRtpArgs = [
     ...commonInputArgs,
     ...encoderArgs.preInput,
@@ -182,9 +184,11 @@ const spawnFFmpeg = async (
   ];
 
   // Audio: source -> downmix -> opus -> RTP (direct, no HLS)
-  // asetpts=N/SR/TB resets audio timestamps from scratch after the pan filter
+  // use_wallclock_as_timestamps only on audio — safe here because asetpts resets
+  // timestamps anyway, and audio is not affected by the frame-drop issue
   const audioRtpArgs = [
     ...commonInputArgs,
+    "-use_wallclock_as_timestamps", "1",
     "-i", options.sourceUrl,
     "-map", "0:a:0",
     "-vn",
