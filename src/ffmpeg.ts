@@ -30,18 +30,34 @@ type TProcessPair = {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const getBinaryPath = (): string => {
-  let binaryName = "ffmpeg.exe";
+// Helper to determine which FFmpeg to use and whether to allow HW acceleration
+const getFFmpegSetup = (log: (...messages: unknown[]) => void): { binaryPath: string; allowHwAccel: boolean } => {
+  try {
+    // 1. Check if system-wide FFmpeg is installed
+    const proc = Bun.spawnSync(["ffmpeg", "-version"]);
+    if (proc.success) {
+      log("System-wide FFmpeg detected! Hardware acceleration checks enabled.");
+      return { binaryPath: "ffmpeg", allowHwAccel: true };
+    }
+  } catch (err) {
+    // Ignore error, it just means it's not in the system PATH
+  }
 
+  // 2. Fallback to local binary
+  let binaryName = "ffmpeg.exe";
   if (process.platform !== "win32") {
     binaryName = "ffmpeg";
   }
 
-  return path.join(__dirname, "bin", binaryName);
+  const localPath = path.join(__dirname, "bin", binaryName);
+  log(`System FFmpeg not found. Falling back to local binary at: ${localPath}`);
+  log("Hardware acceleration disabled (Forcing CPU encoding for local binary).");
+
+  return { binaryPath: localPath, allowHwAccel: false };
 };
 
 // Helper function to detect and return the best hardware acceleration arguments
-const getEncoderArgs = (binaryPath: string, log: (...messages: unknown[]) => void): string[] => {
+const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...messages: unknown[]) => void): string[] => {
   // 1. The standard CPU fallback arguments
   const cpuArgs = [
     "-vf", "yadif=1:-1:0", // Deinterlace
@@ -52,6 +68,11 @@ const getEncoderArgs = (binaryPath: string, log: (...messages: unknown[]) => voi
     "-level", "3.1",
     "-pix_fmt", "yuv420p",
   ];
+
+  // If local binary is used, skip all hardware checks
+  if (!allowHwAccel) {
+    return cpuArgs;
+  }
 
   try {
     // 2. Ask FFmpeg what encoders it supports
@@ -102,9 +123,9 @@ const spawnFFmpeg = async (
   pluginPath: string,
   options: TOptions,
 ): Promise<TProcessPair> => {
-  const binaryPath = getBinaryPath();
-
-  options.log(`Binary path: ${binaryPath}`);
+  
+  // Dynamically determine which FFmpeg to use
+  const { binaryPath, allowHwAccel } = getFFmpegSetup(options.log);
 
   const hlsDir = path.join(pluginPath, "hls");
   const hlsPlaylist = path.join(hlsDir, "stream.m3u8");
@@ -139,7 +160,7 @@ const spawnFFmpeg = async (
   }
 
   // Detect and inject hardware acceleration arguments
-  const encoderArgs = getEncoderArgs(binaryPath, options.log);
+  const encoderArgs = getEncoderArgs(binaryPath, allowHwAccel, options.log);
 
   // create HLS buffer from IPTV
   const hlsArgs = [
