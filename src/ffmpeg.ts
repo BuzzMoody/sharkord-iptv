@@ -87,9 +87,9 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
     if (isLinux && encoders.includes("h264_vaapi") && hasDri) {
       log("Hardware Acceleration: VAAPI detected! (Linux Preferred)");
       return [
-        "-init_hw_device", "vaapi=hw:/dev/dri/renderD128", // Explicitly initialize the device
-        "-filter_hw_device", "hw",                         // Tell the filter chain to use it
-        "-vf", "yadif=1:-1:0,format=nv12,hwupload",        // Deinterlace in CPU, upload to GPU
+        "-init_hw_device", "vaapi=hw:/dev/dri/renderD128",
+        "-filter_hw_device", "hw",
+        "-vf", "yadif=1:-1:0,format=nv12,hwupload",
         "-c:v", "h264_vaapi",
         "-profile:v", "baseline",
         "-level", "3.1"
@@ -230,11 +230,19 @@ const spawnFFmpeg = async (
 
   options.log("Starting HLS buffer creation...");
 
+  // Explicitly pass VAAPI env vars so child FFmpeg processes can find the iHD driver
+  const vaapiEnv = {
+    ...process.env,
+    LIBVA_DRIVER_NAME: "iHD",
+    LIBVA_DRIVERS_PATH: "/usr/lib/x86_64-linux-gnu/dri",
+  };
+
   const hlsProcess = Bun.spawn({
     cmd: [binaryPath, ...hlsArgs],
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
+    env: vaapiEnv,
   });
 
   (async () => {
@@ -315,6 +323,7 @@ const spawnFFmpeg = async (
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
+    env: vaapiEnv,
   });
 
   // stream AUDIO from hls to rtp
@@ -350,6 +359,7 @@ const spawnFFmpeg = async (
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
+    env: vaapiEnv,
   });
 
   (async () => {
