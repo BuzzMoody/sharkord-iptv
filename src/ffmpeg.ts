@@ -55,18 +55,26 @@ const getFFmpegSetup = (log: (...messages: unknown[]) => void): { binaryPath: st
   return { binaryPath: localPath, allowHwAccel: false };
 };
 
+type TEncoderArgs = {
+  preInput: string[];   // args that must come BEFORE -i (hw device init)
+  postInput: string[];  // args that come AFTER -i (filters, codec, profile)
+};
+
 // Helper function to detect and return the best hardware acceleration arguments
-const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...messages: unknown[]) => void): string[] => {
-  // 1. The standard CPU fallback arguments
-  const cpuArgs = [
-    "-vf", "yadif=1:-1:0", // Deinterlace
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-tune", "zerolatency",
-    "-profile:v", "baseline",
-    "-level", "3.1",
-    "-pix_fmt", "yuv420p",
-  ];
+const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...messages: unknown[]) => void): TEncoderArgs => {
+  // 1. The standard CPU fallback
+  const cpuArgs: TEncoderArgs = {
+    preInput: [],
+    postInput: [
+      "-vf", "format=yuv420p",
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-tune", "zerolatency",
+      "-profile:v", "baseline",
+      "-level", "3.1",
+      "-pix_fmt", "yuv420p",
+    ],
+  };
 
   // If local binary is used, skip all hardware checks
   if (!allowHwAccel) {
@@ -79,34 +87,40 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
     const encoders = proc.stdout.toString();
 
     const isLinux = process.platform === "linux";
-    // Check if the Intel/AMD GPU render node exists on Linux
     const hasDri = isLinux && fs.existsSync("/dev/dri/renderD128");
 
     // 3. Try VAAPI FIRST on Linux
     if (isLinux && encoders.includes("h264_vaapi") && hasDri) {
       log("Hardware Acceleration: VAAPI detected! (Linux Preferred)");
-      return [
-        "-init_hw_device", "vaapi=hw:/dev/dri/renderD128", // Explicitly initialize the device
-        "-filter_hw_device", "hw",                         // Tell the filter chain to use it
-        "-vf", "yadif=1:-1:0,format=nv12,hwupload",        // Deinterlace in CPU, upload to GPU
-        "-c:v", "h264_vaapi",
-        "-profile:v", "baseline",
-        "-level", "3.1"
-      ];
+      return {
+        preInput: [
+          "-init_hw_device", "vaapi=hw:/dev/dri/renderD128",
+          "-filter_hw_device", "hw",
+        ],
+        postInput: [
+          "-vf", "format=nv12,hwupload",
+          "-c:v", "h264_vaapi",
+          "-profile:v", "constrained_baseline",
+          "-level:v", "31",
+        ],
+      };
     }
 
-    // 4. Try Intel QuickSync (QSV) (Preferred natively on Windows)
+    // 4. Try Intel QuickSync (QSV)
     if (encoders.includes("h264_qsv") && (process.platform === "win32" || hasDri)) {
       log("Hardware Acceleration: Intel QuickSync (QSV) detected!");
-      const hwInitArgs = isLinux ? ["-init_hw_device", "qsv=hw:/dev/dri/renderD128", "-filter_hw_device", "hw"] : [];
-      return [
-        ...hwInitArgs,
-        "-vf", "yadif=1:-1:0,format=nv12", // Deinterlace in CPU, format for Intel GPU
-        "-c:v", "h264_qsv",
-        "-preset", "veryfast",
-        "-profile:v", "baseline",
-        "-level", "3.1"
-      ];
+      return {
+        preInput: isLinux
+          ? ["-init_hw_device", "qsv=hw:/dev/dri/renderD128", "-filter_hw_device", "hw"]
+          : [],
+        postInput: [
+          "-vf", "format=nv12",
+          "-c:v", "h264_qsv",
+          "-preset", "veryfast",
+          "-profile:v", "constrained_baseline",
+          "-level:v", "31",
+        ],
+      };
     }
 
   } catch (err) {
@@ -126,7 +140,7 @@ const spawnFFmpeg = async (
   // Dynamically determine which FFmpeg to use
   const { binaryPath, allowHwAccel } = getFFmpegSetup(options.log);
 
-  // Define quality bitrate arguments
+  // Quality bitrate arguments
   let qualityArgs: string[] = [];
   switch (options.quality) {
     case "low":
@@ -163,46 +177,29 @@ const spawnFFmpeg = async (
     "-err_detect", "ignore_err",
   ];
 
-  // Video RTP: source -> VAAPI encode -> RTP
+  // Video: source -> hw encode -> RTP
   const videoRtpArgs = [
     ...commonInputArgs,
-
-    // HW init args must come before -i
-    ...encoderArgs.filter(arg =>
-      arg === "-init_hw_device" || arg.startsWith("vaapi") ||
-      arg.startsWith("qsv") || arg === "-filter_hw_device" || arg === "hw"
-    ),
-
+    ...encoderArgs.preInput,       // hw device init (must be before -i)
     "-i", options.sourceUrl,
-
     "-map", "0:v:0",
     "-an",
-
-    // encoder filter/codec args
-    ...encoderArgs.filter(arg =>
-      arg !== "-init_hw_device" && !arg.startsWith("vaapi") &&
-      !arg.startsWith("qsv") && arg !== "-filter_hw_device" && arg !== "hw"
-    ),
-
+    ...encoderArgs.postInput,      // filter, codec, profile (cleanly separated)
     ...qualityArgs,
     "-g", "50",
     "-sc_threshold", "0",
-
     "-payload_type", options.videoPayloadType.toString(),
     "-ssrc", options.videoSsrc.toString(),
     "-f", "rtp",
     `rtp://${options.rtpHost}:${options.videoRtpPort}?pkt_size=1200`,
   ];
 
-  // Audio RTP: source -> downmix -> opus -> RTP (no HLS involved)
+  // Audio: source -> downmix -> opus -> RTP (direct, no HLS)
   const audioRtpArgs = [
     ...commonInputArgs,
-
     "-i", options.sourceUrl,
-
     "-map", "0:a:0",
     "-vn",
-
     "-af", "pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE",
     "-c:a", "libopus",
     "-ar", "48000",
@@ -211,7 +208,6 @@ const spawnFFmpeg = async (
     "-application", "audio",
     "-vbr", "on",
     "-frame_duration", "20",
-
     "-payload_type", options.audioPayloadType.toString(),
     "-ssrc", options.audioSsrc.toString(),
     "-f", "rtp",
@@ -319,7 +315,6 @@ const spawnFFmpeg = async (
     audioRtp: audioRtpProcess,
   };
 };
-
 
 const killFFmpegProcesses = (processes: TProcessPair): void => {
   if (processes.videoRtp) {
