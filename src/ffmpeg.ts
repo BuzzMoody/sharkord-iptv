@@ -60,7 +60,7 @@ const getFFmpegSetup = (log: (...messages: unknown[]) => void): { binaryPath: st
 const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...messages: unknown[]) => void): string[] => {
   // 1. The standard CPU fallback arguments
   const cpuArgs = [
-    "-vf", "yadif=1:-1:0", // Deinterlace
+    "-vf", "format=yuv420p",
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-tune", "zerolatency",
@@ -89,7 +89,7 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
       return [
         "-init_hw_device", "vaapi=hw:/dev/dri/renderD128",
         "-filter_hw_device", "hw",
-        "-vf", "yadif=1:-1:0,format=nv12,hwupload",
+        "-vf", "format=nv12,hwupload",
         "-c:v", "h264_vaapi",
         "-profile:v", "constrained_baseline",
         "-level:v", "31",
@@ -105,8 +105,8 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
         "-vf", "yadif=1:-1:0,format=nv12", // Deinterlace in CPU, format for Intel GPU
         "-c:v", "h264_qsv",
         "-preset", "veryfast",
-        "-profile:v", "constrained_baseline",
-        "-level:v", "31",
+        "-profile:v", "baseline",
+        "-level", "3.1"
       ];
     }
 
@@ -199,15 +199,8 @@ const spawnFFmpeg = async (
     "-sc_threshold",
     "0",
 
-    // audio: convert to opus
-    "-c:a",
-    "libopus",
-    "-ar",
-    "48000",
-    "-ac",
-    "2",
-    "-b:a",
-    "128k",
+    // video only in HLS - audio goes direct from source to RTP to avoid timestamp drift
+    "-an",
 
     // hls output with bigger buffer
     "-f",
@@ -230,7 +223,6 @@ const spawnFFmpeg = async (
 
   options.log("Starting HLS buffer creation...");
 
-  // Explicitly pass VAAPI env vars so child FFmpeg processes can find the iHD driver
   const vaapiEnv = {
     ...process.env,
     LIBVA_DRIVER_NAME: "iHD",
@@ -326,29 +318,37 @@ const spawnFFmpeg = async (
     env: vaapiEnv,
   });
 
-  // stream AUDIO from hls to rtp
+  // stream AUDIO direct from source to RTP (bypasses HLS to avoid timestamp drift)
   const audioRtpArgs = [
-    "-re",
-    "-stream_loop",
-    "-1",
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_on_network_error", "1",
+    "-reconnect_delay_max", "5",
+    "-timeout", "10000000",
+    "-user_agent", "Mozilla/5.0",
+
+    "-fflags", "+genpts+discardcorrupt",
+    "-err_detect", "ignore_err",
 
     "-i",
-    hlsPlaylist,
+    options.sourceUrl,
 
-    "-map",
-    "0:a:0",
+    "-map", "0:a:0",
     "-vn",
 
-    // just copy audio - already opus
-    "-c:a",
-    "copy",
+    // downmix to stereo and encode as opus
+    "-af", "pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE",
+    "-c:a", "libopus",
+    "-ar", "48000",
+    "-ac", "2",
+    "-b:a", "128k",
+    "-application", "audio",
+    "-vbr", "on",
+    "-frame_duration", "20",
 
-    "-payload_type",
-    options.audioPayloadType.toString(),
-    "-ssrc",
-    options.audioSsrc.toString(),
-    "-f",
-    "rtp",
+    "-payload_type", options.audioPayloadType.toString(),
+    "-ssrc", options.audioSsrc.toString(),
+    "-f", "rtp",
     `rtp://${options.rtpHost}:${options.audioRtpPort}?pkt_size=1200`,
   ];
 
