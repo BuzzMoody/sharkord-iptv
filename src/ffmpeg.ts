@@ -1,11 +1,29 @@
 import path from "path";
-import fs from "fs";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
 
-type TOptions = {
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+export type TStreamInfo = {
+  videoCodec: string;       // e.g. "h264"
+  audioCodec: string;       // e.g. "ac3", "aac", "mp2"
+  width: number;
+  height: number;
+  fps: number;
+  profileLevelId: string;   // hex string for mediasoup, e.g. "640032"
+  isH264: boolean;
+  needsVideoTranscode: boolean;
+  needsAudioTranscode: boolean; // always true — we always output opus for mediasoup
+};
+
+export type TProcessPair = {
+  videoRtp?: ReturnType<typeof Bun.spawn> | null;
+  audioRtp?: ReturnType<typeof Bun.spawn> | null;
+};
+
+export type TSpawnOptions = {
   sourceUrl: string;
-  gopSize: number;
+  streamInfo: TStreamInfo;
   videoPayloadType: number;
   audioPayloadType: number;
   videoSsrc: number;
@@ -13,149 +31,164 @@ type TOptions = {
   rtpHost: string;
   videoRtpPort: number;
   audioRtpPort: number;
-  packetSize: number;
-  quality: "low" | "medium" | "high" | "original";
   log: (...messages: unknown[]) => void;
   error: (...messages: unknown[]) => void;
 };
 
-type TProcessPair = {
-  videoRtp?: ReturnType<typeof Bun.spawn> | null;
-  audioRtp?: ReturnType<typeof Bun.spawn> | null;
-};
-
-// preInput: args that MUST come before -i (hw device init)
-// postInput: args that come after -i (filters, codec, profile)
-type TEncoderArgs = {
-  preInput: string[];
-  postInput: string[];
-};
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const getFFmpegSetup = (log: (...messages: unknown[]) => void): { binaryPath: string; allowHwAccel: boolean } => {
+const getFFmpegBin = (): string => {
   try {
     const proc = Bun.spawnSync(["ffmpeg", "-version"]);
-    if (proc.success) {
-      log("System-wide FFmpeg detected! Hardware acceleration checks enabled.");
-      return { binaryPath: "ffmpeg", allowHwAccel: true };
-    }
-  } catch (err) {
-    // not in PATH
-  }
+    if (proc.success) return "ffmpeg";
+  } catch {}
 
-  let binaryName = "ffmpeg.exe";
-  if (process.platform !== "win32") {
-    binaryName = "ffmpeg";
-  }
-
-  const localPath = path.join(__dirname, "bin", binaryName);
-  log(`System FFmpeg not found. Falling back to local binary at: ${localPath}`);
-  log("Hardware acceleration disabled (Forcing CPU encoding for local binary).");
-  return { binaryPath: localPath, allowHwAccel: false };
+  const name = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  return path.join(__dirname, "bin", name);
 };
 
-// Returns cleanly separated pre/post input encoder args
-const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...messages: unknown[]) => void): TEncoderArgs => {
-  const cpuArgs: TEncoderArgs = {
-    preInput: [],
-    postInput: [
-      "-vf", "format=yuv420p",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-tune", "zerolatency",
-      "-profile:v", "baseline",
-      "-level", "3.1",
-      "-pix_fmt", "yuv420p",
-    ],
-  };
-
-  if (!allowHwAccel) return cpuArgs;
-
+const getFFprobeBin = (): string => {
   try {
-    const proc = Bun.spawnSync([binaryPath, "-encoders"]);
-    const encoders = proc.stdout.toString();
-    const isLinux = process.platform === "linux";
-    const hasDri = isLinux && fs.existsSync("/dev/dri/renderD128");
+    const proc = Bun.spawnSync(["ffprobe", "-version"]);
+    if (proc.success) return "ffprobe";
+  } catch {}
 
-    if (isLinux && encoders.includes("h264_vaapi") && hasDri) {
-      log("Hardware Acceleration: VAAPI detected! Full GPU decode+encode pipeline.");
-      // Decode H264 directly on GPU via VAAPI so frames never leave GPU memory.
-      // This avoids the CPU-decode -> DMA-upload bottleneck that causes frame drops
-      // on virtual iGPUs where the upload path is too slow for 50fps 1080p.
-      return {
-        preInput: [
-          "-hwaccel", "vaapi",
-          "-hwaccel_device", "/dev/dri/renderD128",
-          "-hwaccel_output_format", "vaapi",
-        ],
-        postInput: [
-          // frames are already in GPU memory — no upload needed
-          "-vf", "scale_vaapi=w=iw:h=ih:format=nv12",
-          "-c:v", "h264_vaapi",
-          "-profile:v", "constrained_baseline",
-          "-level:v", "31",
-        ],
-      };
-    }
-
-    if (encoders.includes("h264_qsv") && (process.platform === "win32" || hasDri)) {
-      log("Hardware Acceleration: Intel QuickSync (QSV) detected!");
-      return {
-        preInput: isLinux
-          ? ["-init_hw_device", "qsv=hw:/dev/dri/renderD128", "-filter_hw_device", "hw"]
-          : [],
-        postInput: [
-          "-vf", "format=nv12",
-          "-c:v", "h264_qsv",
-          "-preset", "veryfast",
-          "-profile:v", "constrained_baseline",
-          "-level:v", "31",
-        ],
-      };
-    }
-
-  } catch (err) {
-    log("Failed to detect hardware acceleration, falling back to CPU.");
-  }
-
-  log("Hardware Acceleration: None detected. Falling back to CPU (libx264).");
-  return cpuArgs;
+  const name = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+  return path.join(__dirname, "bin", name);
 };
 
-const spawnFFmpeg = async (
-  pluginPath: string,
-  options: TOptions,
-): Promise<TProcessPair> => {
+// Convert H264 profile + level integers to the 3-byte hex profile-level-id
+// that mediasoup/SDP expects (e.g. "640032" = High 5.0)
+const buildProfileLevelId = (profile: number, level: number): string => {
+  // constraint_set flags byte — 0x00 for High, 0x40 for Baseline constrained
+  const constraints = profile === 66 ? 0xe0 : 0x00;
+  return [profile, constraints, level]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+};
 
-  const { binaryPath, allowHwAccel } = getFFmpegSetup(options.log);
-  const encoderArgs = getEncoderArgs(binaryPath, allowHwAccel, options.log);
+// Run ffprobe on the source and return everything mediasoup needs to know
+export const probeStream = async (
+  sourceUrl: string,
+  log: (...messages: unknown[]) => void,
+): Promise<TStreamInfo> => {
+  const ffprobe = getFFprobeBin();
 
-  let qualityArgs: string[] = [];
-  switch (options.quality) {
-    case "low":
-      qualityArgs = ["-b:v", "1000k", "-maxrate", "1500k", "-bufsize", "3000k", "-r", "24"];
-      break;
-    case "high":
-      qualityArgs = ["-b:v", "6000k", "-maxrate", "8000k", "-bufsize", "16000k"];
-      break;
-    case "original":
-      qualityArgs = ["-b:v", "12000k", "-maxrate", "12000k", "-bufsize", "24000k"];
-      break;
-    case "medium":
-    default:
-      qualityArgs = ["-b:v", "2500k", "-maxrate", "3000k", "-bufsize", "6000k", "-r", "30"];
-      break;
+  log("Probing stream:", sourceUrl);
+
+  const proc = Bun.spawnSync([
+    ffprobe,
+    "-v", "quiet",
+    "-print_format", "json",
+    "-show_streams",
+    "-show_format",
+    "-user_agent", "Mozilla/5.0",
+    "-timeout", "10000000",
+    sourceUrl,
+  ]);
+
+  const raw = proc.stdout.toString();
+  const data = JSON.parse(raw);
+  const streams: any[] = data.streams ?? [];
+
+  const videoStream = streams.find((s) => s.codec_type === "video");
+  const audioStream = streams.find((s) => s.codec_type === "audio");
+
+  if (!videoStream) throw new Error("No video stream found in source");
+  if (!audioStream) throw new Error("No audio stream found in source");
+
+  const videoCodec = videoStream.codec_name ?? "unknown";
+  const audioCodec = audioStream.codec_name ?? "unknown";
+
+  // Parse fps from r_frame_rate (e.g. "50/1") or avg_frame_rate
+  const fpsStr = videoStream.r_frame_rate ?? videoStream.avg_frame_rate ?? "25/1";
+  const [num, den] = fpsStr.split("/").map(Number);
+  const fps = den > 0 ? Math.round((num / den) * 100) / 100 : 25;
+
+  const width = videoStream.width ?? 1920;
+  const height = videoStream.height ?? 1080;
+  const isH264 = videoCodec === "h264";
+
+  // Build profile-level-id from ffprobe data if available, else use sane defaults
+  let profileLevelId = "42e01f"; // Baseline 3.1 fallback
+  if (isH264) {
+    const profileStr = (videoStream.profile ?? "").toLowerCase();
+    const level = Math.round((videoStream.level ?? 31));
+
+    let profileByte = 0x42; // Baseline
+    if (profileStr.includes("high")) profileByte = 0x64;
+    else if (profileStr.includes("main")) profileByte = 0x4d;
+
+    profileLevelId = buildProfileLevelId(profileByte, level);
   }
 
-  const vaapiEnv = {
+  // We can copy H264 video directly into RTP — no re-encode needed
+  // Any other codec needs transcoding to H264
+  const needsVideoTranscode = !isH264;
+
+  // Audio always gets transcoded to Opus for mediasoup
+  const needsAudioTranscode = true;
+
+  log(`Probe result: ${videoCodec} ${width}x${height} @ ${fps}fps, audio: ${audioCodec}`);
+  log(`Profile-level-id: ${profileLevelId}, needsVideoTranscode: ${needsVideoTranscode}`);
+
+  return {
+    videoCodec,
+    audioCodec,
+    width,
+    height,
+    fps,
+    profileLevelId,
+    isH264,
+    needsVideoTranscode,
+    needsAudioTranscode,
+  };
+};
+
+// Pipe stderr/stdout of a spawned process to the log functions
+const pipeOutput = (
+  proc: ReturnType<typeof Bun.spawn>,
+  label: string,
+  log: (...m: unknown[]) => void,
+  error: (...m: unknown[]) => void,
+) => {
+  (async () => {
+    const reader = proc.stdout.getReader();
+    const dec = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const t = dec.decode(value, { stream: true }).trim();
+        if (t) log(`[${label} stdout]`, t);
+      }
+    } catch (e) { error(`[${label} stdout error]`, e); }
+  })();
+
+  (async () => {
+    const reader = proc.stderr.getReader();
+    const dec = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const t = dec.decode(value, { stream: true }).trim();
+        if (t) log(`[${label} stderr]`, t);
+      }
+    } catch (e) { error(`[${label} stderr error]`, e); }
+  })();
+};
+
+export const spawnFFmpeg = (options: TSpawnOptions): TProcessPair => {
+  const ffmpeg = getFFmpegBin();
+  const { streamInfo } = options;
+
+  const env = {
     ...process.env,
     LIBVA_DRIVER_NAME: "iHD",
     LIBVA_DRIVERS_PATH: "/usr/lib/x86_64-linux-gnu/dri",
   };
 
-  // Base input args shared by both processes
-  const commonInputArgs = [
+  // Common input args for both processes
+  const inputArgs = [
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_on_network_error", "1",
@@ -164,40 +197,57 @@ const spawnFFmpeg = async (
     "-user_agent", "Mozilla/5.0",
     "-fflags", "+genpts+discardcorrupt",
     "-err_detect", "ignore_err",
-    // Avoid excessive buffering on live streams so encoding starts promptly
-    "-max_delay", "500000",
-    "-avioflags", "direct",
   ];
 
-  // Video: source -> RTP (copy — no re-encode)
-  // The source is already H264 High, so we pass it straight through.
-  // Re-encoding via VAAPI can't keep up with 50fps 1080p on a virtual iGPU.
-  // mediasoup accepts H264 High directly so no transcoding is needed.
+  // ── VIDEO ──────────────────────────────────────────────────────────────────
+  // If the source is already H264, copy it straight into RTP — zero re-encode.
+  // If it's something else (HEVC, MPEG2, etc), transcode to H264 via CPU.
+  // We deliberately avoid VAAPI here: the virtual iGPU in Proxmox cannot keep
+  // up with 50fps 1080p re-encoding due to DMA upload latency.
+  const videoEncodeArgs = streamInfo.needsVideoTranscode
+    ? [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+        "-profile:v", "baseline",
+        "-level", "3.1",
+        "-pix_fmt", "yuv420p",
+        "-b:v", "2500k",
+        "-maxrate", "3000k",
+        "-bufsize", "6000k",
+      ]
+    : ["-c:v", "copy"];
+
   const videoRtpArgs = [
-    ...commonInputArgs,
+    ...inputArgs,
     "-i", options.sourceUrl,
     "-map", "0:v:0",
     "-an",
-    "-c:v", "copy",
+    ...videoEncodeArgs,
     "-payload_type", options.videoPayloadType.toString(),
     "-ssrc", options.videoSsrc.toString(),
     "-f", "rtp",
     `rtp://${options.rtpHost}:${options.videoRtpPort}?pkt_size=1200`,
   ];
 
-  // Audio: source -> downmix -> opus -> RTP (direct, no HLS)
-  // use_wallclock_as_timestamps only on audio — safe here because asetpts resets
-  // timestamps anyway, and audio is not affected by the frame-drop issue
+  // ── AUDIO ──────────────────────────────────────────────────────────────────
+  // Always transcode to Opus — mediasoup requires it.
+  // Detect channel layout and downmix surround to stereo if needed.
+  const channels = 2; // always output stereo
+  const audioFilterArgs = streamInfo.audioCodec === "ac3" || streamInfo.audioCodec === "eac3"
+    ? ["-af", "pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE,asetpts=N/SR/TB"]
+    : ["-af", "aresample=48000,asetpts=N/SR/TB"];
+
   const audioRtpArgs = [
-    ...commonInputArgs,
+    ...inputArgs,
     "-use_wallclock_as_timestamps", "1",
     "-i", options.sourceUrl,
     "-map", "0:a:0",
     "-vn",
-    "-af", "pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE,asetpts=N/SR/TB",
+    ...audioFilterArgs,
     "-c:a", "libopus",
     "-ar", "48000",
-    "-ac", "2",
+    "-ac", channels.toString(),
     "-b:a", "128k",
     "-application", "audio",
     "-vbr", "on",
@@ -208,84 +258,34 @@ const spawnFFmpeg = async (
     `rtp://${options.rtpHost}:${options.audioRtpPort}?pkt_size=1200`,
   ];
 
-  options.log("Starting video RTP stream (direct from source)...");
+  options.log("Starting video RTP process...");
+  options.log("Video args:", [ffmpeg, ...videoRtpArgs].join(" "));
 
   const videoRtpProcess = Bun.spawn({
-    cmd: [binaryPath, ...videoRtpArgs],
+    cmd: [ffmpeg, ...videoRtpArgs],
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
-    env: vaapiEnv,
+    env,
   });
 
-  options.log("Starting audio RTP stream (direct from source)...");
+  options.log("Starting audio RTP process...");
 
   const audioRtpProcess = Bun.spawn({
-    cmd: [binaryPath, ...audioRtpArgs],
+    cmd: [ffmpeg, ...audioRtpArgs],
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
-    env: vaapiEnv,
+    env,
   });
 
-  (async () => {
-    const reader = videoRtpProcess.stdout.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        options.log("[Video RTP stdout]", decoder.decode(value, { stream: true }).trim());
-      }
-    } catch (error) { options.error("[Video RTP stdout error]", error); }
-  })();
+  pipeOutput(videoRtpProcess, "Video RTP", options.log, options.error);
+  pipeOutput(audioRtpProcess, "Audio RTP", options.log, options.error);
 
-  (async () => {
-    const reader = videoRtpProcess.stderr.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        options.log("[Video RTP stderr]", decoder.decode(value, { stream: true }).trim());
-      }
-    } catch (error) { options.error("[Video RTP stderr error]", error); }
-  })();
-
-  (async () => {
-    const reader = audioRtpProcess.stdout.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        options.log("[Audio RTP stdout]", decoder.decode(value, { stream: true }).trim());
-      }
-    } catch (error) { options.error("[Audio RTP stdout error]", error); }
-  })();
-
-  (async () => {
-    const reader = audioRtpProcess.stderr.getReader();
-    const decoder = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        options.log("[Audio RTP stderr]", decoder.decode(value, { stream: true }).trim());
-      }
-    } catch (error) { options.error("[Audio RTP stderr error]", error); }
-  })();
-
-  return {
-    videoRtp: videoRtpProcess,
-    audioRtp: audioRtpProcess,
-  };
+  return { videoRtp: videoRtpProcess, audioRtp: audioRtpProcess };
 };
 
-const killFFmpegProcesses = (processes: TProcessPair): void => {
-  if (processes.videoRtp) processes.videoRtp.kill();
-  if (processes.audioRtp) processes.audioRtp.kill();
+export const killFFmpegProcesses = (processes: TProcessPair): void => {
+  processes.videoRtp?.kill();
+  processes.audioRtp?.kill();
 };
-
-export { spawnFFmpeg, killFFmpegProcesses };
-export type { TOptions, TProcessPair };
