@@ -228,11 +228,12 @@ const startStream = async (
     });
 
     state.audioTransport = await router.createPlainTransport({
-      listenIp: {
+      listenInfo: {
         ip,
-        announcedIp: announcedAddress,
+        protocol: "udp",
+        announcedAddress: announcedAddress,
       },
-      rtcpMux: true,
+      rtcpMux: false,
       comedia: true,
       enableSrtp: false,
     });
