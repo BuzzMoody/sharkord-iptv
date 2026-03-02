@@ -169,16 +169,16 @@ const spawnFFmpeg = async (
     "-avioflags", "direct",
   ];
 
-  // Video: source -> hw encode -> RTP
+  // Video: source -> RTP (copy — no re-encode)
+  // The source is already H264 High, so we pass it straight through.
+  // Re-encoding via VAAPI can't keep up with 50fps 1080p on a virtual iGPU.
+  // mediasoup accepts H264 High directly so no transcoding is needed.
   const videoRtpArgs = [
     ...commonInputArgs,
-    ...encoderArgs.preInput,
     "-i", options.sourceUrl,
     "-map", "0:v:0",
     "-an",
-    ...encoderArgs.postInput,
-    ...qualityArgs,
-    "-g", "50",
+    "-c:v", "copy",
     "-payload_type", options.videoPayloadType.toString(),
     "-ssrc", options.videoSsrc.toString(),
     "-f", "rtp",

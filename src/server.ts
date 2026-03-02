@@ -228,12 +228,11 @@ const startStream = async (
     });
 
     state.audioTransport = await router.createPlainTransport({
-      listenInfo: {
+      listenIp: {
         ip,
-        protocol: "udp",
-        announcedAddress: announcedAddress,
+        announcedIp: announcedAddress,
       },
-      rtcpMux: false,
+      rtcpMux: true,
       comedia: true,
       enableSrtp: false,
     });
@@ -251,7 +250,7 @@ const startStream = async (
             clockRate: 90000,
             parameters: {
               "packetization-mode": 1,
-              "profile-level-id": "42e01f",
+              "profile-level-id": "640032",  // High 5.0 — matches source H264 High profile
               "level-asymmetry-allowed": 1,
               "x-google-start-bitrate": 1000, // You can increase this to 3000 if desired
             },
