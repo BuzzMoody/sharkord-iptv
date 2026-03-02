@@ -83,12 +83,13 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
     // Check if the Intel/AMD GPU render node exists on Linux
     const hasDri = isLinux && fs.existsSync("/dev/dri/renderD128");
 
-    // 3. Try VAAPI FIRST on Linux (Much more stable in Docker containers)
+    // 3. Try VAAPI FIRST on Linux
     if (isLinux && encoders.includes("h264_vaapi") && hasDri) {
       log("Hardware Acceleration: VAAPI detected! (Linux Preferred)");
       return [
-        "-vaapi_device", "/dev/dri/renderD128",
-        "-vf", "yadif=1:-1:0,format=nv12,hwupload", // Upload frames to GPU memory
+        "-init_hw_device", "vaapi=hw:/dev/dri/renderD128", // Explicitly initialize the device
+        "-filter_hw_device", "hw",                         // Tell the filter chain to use it
+        "-vf", "yadif=1:-1:0,format=nv12,hwupload",        // Deinterlace in CPU, upload to GPU
         "-c:v", "h264_vaapi",
         "-profile:v", "baseline",
         "-level", "3.1"
@@ -98,7 +99,6 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
     // 4. Try Intel QuickSync (QSV) (Preferred natively on Windows)
     if (encoders.includes("h264_qsv") && (process.platform === "win32" || hasDri)) {
       log("Hardware Acceleration: Intel QuickSync (QSV) detected!");
-      // On Linux, QSV needs explicit device initialization
       const hwInitArgs = isLinux ? ["-init_hw_device", "qsv=hw:/dev/dri/renderD128", "-filter_hw_device", "hw"] : [];
       return [
         ...hwInitArgs,
@@ -182,11 +182,14 @@ const spawnFFmpeg = async (
     "-err_detect",
     "ignore_err",
 
+    // This must come BEFORE the input for the new initialization syntax
+    ...encoderArgs.filter(arg => arg === "-init_hw_device" || arg.startsWith("vaapi") || arg.startsWith("qsv") || arg === "-filter_hw_device" || arg === "hw"),
+
     "-i",
     options.sourceUrl,
 
-    // Inject hardware or CPU encoding settings
-    ...encoderArgs,
+    // The rest of the encoder args (filters, codecs, etc.)
+    ...encoderArgs.filter(arg => arg !== "-init_hw_device" && !arg.startsWith("vaapi") && !arg.startsWith("qsv") && arg !== "-filter_hw_device" && arg !== "hw"),
 
     // Inject dynamic quality/bitrate arguments
     ...qualityArgs,
