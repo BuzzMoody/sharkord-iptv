@@ -91,8 +91,8 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
         "-filter_hw_device", "hw",
         "-vf", "yadif=1:-1:0,format=nv12,hwupload",
         "-c:v", "h264_vaapi",
-        "-profile:v", "baseline",
-        "-level", "3.1"
+        "-profile:v", "constrained_baseline",
+        "-level:v", "31",
       ];
     }
 
@@ -105,8 +105,8 @@ const getEncoderArgs = (binaryPath: string, allowHwAccel: boolean, log: (...mess
         "-vf", "yadif=1:-1:0,format=nv12", // Deinterlace in CPU, format for Intel GPU
         "-c:v", "h264_qsv",
         "-preset", "veryfast",
-        "-profile:v", "baseline",
-        "-level", "3.1"
+        "-profile:v", "constrained_baseline",
+        "-level:v", "31",
       ];
     }
 
