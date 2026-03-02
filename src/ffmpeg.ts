@@ -165,8 +165,6 @@ const spawnFFmpeg = async (
   ];
 
   // Video: source -> hw encode -> RTP
-  // No wallclock timestamp rewriting — that causes massive frame drops on streams
-  // with large PCR values (FFmpeg enters catch-up mode trying to sync to wall clock)
   const videoRtpArgs = [
     ...commonInputArgs,
     ...encoderArgs.preInput,
@@ -177,6 +175,11 @@ const spawnFFmpeg = async (
     ...qualityArgs,
     "-g", "50",
     "-sc_threshold", "0",
+    // Normalize the huge epoch-based PCR timestamps from the source to start at 0
+    // Without this the RTP timestamp field overflows and the receiver freezes
+    "-copyts",
+    "-start_at_zero",
+    "-vsync", "cfr",
     "-payload_type", options.videoPayloadType.toString(),
     "-ssrc", options.videoSsrc.toString(),
     "-f", "rtp",
