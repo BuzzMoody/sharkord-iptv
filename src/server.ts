@@ -13,8 +13,10 @@ import { killFFmpegProcesses, spawnFFmpeg, type TProcessPair } from "./ffmpeg";
 import {
   zPlayStreamCommand,
   zStartStreamCommand,
+  zQualityCommand,
   type TPlayStreamCommand,
   type TStartStreamCommand,
+  type TQualityCommand,
 } from "./types";
 
 type TStreamState = {
@@ -360,8 +362,7 @@ const onLoad = async (ctx: PluginContext) => {
     },
   ]);
 
-  // NEW COMMAND: /iptv_quality
-  ctx.commands.register({
+  ctx.commands.register<TQualityCommand>({
     name: "iptv_quality",
     description: "Change the video quality. If a stream is active, you will need to restart it.",
     args: [
@@ -372,13 +373,16 @@ const onLoad = async (ctx: PluginContext) => {
         required: true,
       },
     ],
-    executes: async (invoker, input: any) => {
+    executes: async (invoker, input) => {
       if (invoker.currentVoiceChannelId === undefined) {
         throw new Error("You must be in a voice channel to change quality.");
       }
 
       const channelId = invoker.currentVoiceChannelId;
-      const level = input.level.toLowerCase();
+      
+      // Parse the input using Zod, exactly how the other commands do it
+      const { level: rawLevel } = zQualityCommand.parse(input);
+      const level = rawLevel.toLowerCase() as "low" | "medium" | "high" | "original";
 
       if (!["low", "medium", "high", "original"].includes(level)) {
         throw new Error("Invalid quality. Please choose: low, medium, high, or original.");
