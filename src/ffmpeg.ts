@@ -40,6 +40,60 @@ const getBinaryPath = (): string => {
   return path.join(__dirname, "bin", binaryName);
 };
 
+const getEncoderArgs = (binaryPath: string, log: (...messages: unknown[]) => void): string[] => {
+  // 1. The standard CPU fallback arguments
+  const cpuArgs = [
+    "-vf", "yadif=1:-1:0", // Deinterlace
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-tune", "zerolatency",
+    "-profile:v", "baseline",
+    "-level", "3.1",
+    "-pix_fmt", "yuv420p",
+  ];
+
+  try {
+    // 2. Ask FFmpeg what encoders it supports
+    const proc = Bun.spawnSync([binaryPath, "-encoders"]);
+    const encoders = proc.stdout.toString();
+
+    const isLinux = process.platform === "linux";
+    // Check if the Intel/AMD GPU render node exists on Linux
+    const hasDri = isLinux && fs.existsSync("/dev/dri/renderD128");
+
+    // 3. Try Intel QuickSync (QSV) First (Works on Windows natively, or Linux with DRI)
+    if (encoders.includes("h264_qsv") && (process.platform === "win32" || hasDri)) {
+      log("Hardware Acceleration: Intel QuickSync (QSV) detected!");
+      return [
+        "-vf", "yadif=1:-1:0,format=nv12", // Deinterlace in CPU, format for Intel GPU
+        "-c:v", "h264_qsv",
+        "-preset", "veryfast",
+        "-profile:v", "baseline",
+        "-level", "3.1"
+      ];
+    }
+
+    // 4. Try VAAPI (Generic Linux Hardware Acceleration)
+    if (encoders.includes("h264_vaapi") && hasDri) {
+      log("Hardware Acceleration: VAAPI detected!");
+      return [
+        "-vaapi_device", "/dev/dri/renderD128",
+        "-vf", "yadif=1:-1:0,format=nv12,hwupload", // Upload frames to GPU memory
+        "-c:v", "h264_vaapi",
+        "-profile:v", "baseline",
+        "-level", "3.1"
+      ];
+    }
+
+  } catch (err) {
+    log("Failed to detect hardware acceleration, falling back to CPU.");
+  }
+
+  // 5. Fallback if no hardware is found
+  log("Hardware Acceleration: None detected. Falling back to CPU (libx264).");
+  return cpuArgs;
+};
+
 const spawnFFmpeg = async (
   pluginPath: string,
   options: TOptions,
@@ -82,46 +136,22 @@ const spawnFFmpeg = async (
 
   // create HLS buffer from IPTV
   const hlsArgs = [
-    "-reconnect",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_on_network_error",
-    "1",
-    "-reconnect_delay_max",
-    "5",
-    "-timeout",
-    "10000000",
-    "-user_agent",
-    "Mozilla/5.0",
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_on_network_error", "1",
+    "-reconnect_delay_max", "5",
+    "-timeout", "10000000",
+    "-user_agent", "Mozilla/5.0",
 
-    "-fflags",
-    "+genpts+discardcorrupt",
-    "-err_detect",
-    "ignore_err",
+    "-fflags", "+genpts+discardcorrupt",
+    "-err_detect", "ignore_err",
 
-    "-i",
-    options.sourceUrl,
+    "-i", options.sourceUrl,
 
-    // deinterlace here to avoid doing it twice
-    "-vf",
-    "yadif=1:-1:0",
+    // --- INJECT OUR HARDWARE OR CPU ENCODER ARGS HERE ---
+    ...encoderArgs,
 
-    // transcode to H264 baseline here (do it once)
-    "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-tune",
-    "zerolatency",
-    "-profile:v",
-    "baseline",
-    "-level",
-    "3.1",
-    "-pix_fmt",
-    "yuv420p",
-
-    // Inject dynamic quality arguments
+    // Inject dynamic quality arguments (bitrate, maxrate, bufsize, framerate)
     ...qualityArgs,
 
     "-g",
