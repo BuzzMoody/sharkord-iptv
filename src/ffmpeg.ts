@@ -40,6 +40,7 @@ const getBinaryPath = (): string => {
   return path.join(__dirname, "bin", binaryName);
 };
 
+// Helper function to detect and return the best hardware acceleration arguments
 const getEncoderArgs = (binaryPath: string, log: (...messages: unknown[]) => void): string[] => {
   // 1. The standard CPU fallback arguments
   const cpuArgs = [
@@ -61,7 +62,7 @@ const getEncoderArgs = (binaryPath: string, log: (...messages: unknown[]) => voi
     // Check if the Intel/AMD GPU render node exists on Linux
     const hasDri = isLinux && fs.existsSync("/dev/dri/renderD128");
 
-    // 3. Try Intel QuickSync (QSV) First (Works on Windows natively, or Linux with DRI)
+    // 3. Try Intel QuickSync (QSV) First
     if (encoders.includes("h264_qsv") && (process.platform === "win32" || hasDri)) {
       log("Hardware Acceleration: Intel QuickSync (QSV) detected!");
       return [
@@ -134,24 +135,36 @@ const spawnFFmpeg = async (
       break;
   }
 
+  // Detect and inject hardware acceleration arguments
+  const encoderArgs = getEncoderArgs(binaryPath, options.log);
+
   // create HLS buffer from IPTV
   const hlsArgs = [
-    "-reconnect", "1",
-    "-reconnect_streamed", "1",
-    "-reconnect_on_network_error", "1",
-    "-reconnect_delay_max", "5",
-    "-timeout", "10000000",
-    "-user_agent", "Mozilla/5.0",
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_on_network_error",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-timeout",
+    "10000000",
+    "-user_agent",
+    "Mozilla/5.0",
 
-    "-fflags", "+genpts+discardcorrupt",
-    "-err_detect", "ignore_err",
+    "-fflags",
+    "+genpts+discardcorrupt",
+    "-err_detect",
+    "ignore_err",
 
-    "-i", options.sourceUrl,
+    "-i",
+    options.sourceUrl,
 
-    // --- INJECT OUR HARDWARE OR CPU ENCODER ARGS HERE ---
+    // Inject hardware or CPU encoding settings
     ...encoderArgs,
 
-    // Inject dynamic quality arguments (bitrate, maxrate, bufsize, framerate)
+    // Inject dynamic quality/bitrate arguments
     ...qualityArgs,
 
     "-g",
