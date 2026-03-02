@@ -17,6 +17,7 @@ type TOptions = {
   videoRtpPort: number;
   audioRtpPort: number;
   packetSize: number;
+  quality: "low" | "medium" | "high" | "original";
   log: (...messages: unknown[]) => void;
   error: (...messages: unknown[]) => void;
 };
@@ -60,6 +61,25 @@ const spawnFFmpeg = async (
     fs.mkdirSync(hlsDir, { recursive: true });
   }
 
+  // Define quality arguments dynamically
+  let qualityArgs: string[] = [];
+  switch (options.quality) {
+    case "low":
+      qualityArgs = ["-b:v", "1000k", "-maxrate", "1500k", "-bufsize", "3000k", "-r", "24"];
+      break;
+    case "high":
+      qualityArgs = ["-b:v", "6000k", "-maxrate", "8000k", "-bufsize", "16000k"];
+      break;
+    case "original":
+      // Very high ceiling, no frame rate cap (lets source dictate)
+      qualityArgs = ["-b:v", "12000k", "-maxrate", "12000k", "-bufsize", "24000k"];
+      break;
+    case "medium":
+    default:
+      qualityArgs = ["-b:v", "2500k", "-maxrate", "3000k", "-bufsize", "6000k", "-r", "30"];
+      break;
+  }
+
   // create HLS buffer from IPTV
   const hlsArgs = [
     "-reconnect",
@@ -101,20 +121,13 @@ const spawnFFmpeg = async (
     "-pix_fmt",
     "yuv420p",
 
-    // moderate bitrate
-    "-b:v",
-    "2500k",
-    "-maxrate",
-    "3000k",
-    "-bufsize",
-    "6000k",
+    // Inject dynamic quality arguments
+    ...qualityArgs,
 
     "-g",
     "50",
     "-sc_threshold",
     "0",
-    "-r",
-    "25",
 
     // audio: convert to opus
     "-c:a",

@@ -8,7 +8,7 @@
       "client": "client.js"
     },
     "author": "Diogo Martino",
-    "homepage": "https://google.com",
+    "homepage": "https://github.com/diogomartino/sharkord-iptv",
     "description": "A plugin that allows users to stream IPTV channels directly within Sharkord",
     "logo": "https://i.imgur.com/ozINkq3.jpeg"
   },

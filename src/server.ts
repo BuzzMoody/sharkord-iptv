@@ -31,6 +31,8 @@ type TStreamState = {
 };
 
 const streamStates = new Map<number, TStreamState>();
+// Added map to track quality preferences per channel
+const channelQualities = new Map<number, "low" | "medium" | "high" | "original">();
 
 const getStreamState = (channelId: number): TStreamState => {
   const existing = streamStates.get(channelId);
@@ -175,6 +177,8 @@ const startStream = async (
 
   const channelId = invoker.currentVoiceChannelId;
   const state = getStreamState(channelId);
+  // Retrieve the requested quality for this channel
+  const currentQuality = channelQualities.get(channelId) || "medium";
 
   if (state.streamActive) {
     throw new Error(
@@ -246,7 +250,7 @@ const startStream = async (
               "packetization-mode": 1,
               "profile-level-id": "42e01f",
               "level-asymmetry-allowed": 1,
-              "x-google-start-bitrate": 1000,
+              "x-google-start-bitrate": 1000, // You can increase this to 3000 if desired
             },
             rtcpFeedback: [],
           },
@@ -308,6 +312,7 @@ const startStream = async (
         videoRtpPort: state.videoTransport.tuple.localPort,
         audioRtpPort: state.audioTransport.tuple.localPort,
         packetSize: 1200,
+        quality: currentQuality, // Injecting the quality setting here
         log: (...messages: unknown[]) => {
           ctx.debug("[FFmpeg]", ...messages);
         },
@@ -354,6 +359,44 @@ const onLoad = async (ctx: PluginContext) => {
       defaultValue: "",
     },
   ]);
+
+  // NEW COMMAND: /iptv_quality
+  ctx.commands.register({
+    name: "iptv_quality",
+    description: "Change the video quality. If a stream is active, you will need to restart it.",
+    args: [
+      {
+        name: "level",
+        description: "Choose: low, medium, high, or original",
+        type: "string",
+        required: true,
+      },
+    ],
+    executes: async (invoker, input: any) => {
+      if (invoker.currentVoiceChannelId === undefined) {
+        throw new Error("You must be in a voice channel to change quality.");
+      }
+
+      const channelId = invoker.currentVoiceChannelId;
+      const level = input.level.toLowerCase();
+
+      if (!["low", "medium", "high", "original"].includes(level)) {
+        throw new Error("Invalid quality. Please choose: low, medium, high, or original.");
+      }
+
+      // Save the preference
+      channelQualities.set(channelId, level);
+      ctx.log(`Quality set to ${level} for channel ${channelId}`);
+
+      // Check if they need to restart
+      const state = streamStates.get(channelId);
+      if (state && state.streamActive) {
+        throw new Error(`Quality set to ${level}. Please run /iptv_stop and play your channel again to apply the new settings.`);
+      } else {
+        ctx.log(`Quality is now set to ${level}. The next stream you start will use these settings.`);
+      }
+    },
+  });
 
   ctx.commands.register<TStartStreamCommand>({
     name: "iptv_play_direct",

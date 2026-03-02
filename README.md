@@ -4,7 +4,7 @@ Simple IPTV Plugin for Sharkord. Allows you to stream IPTV channels (and others)
 
 ## Installation
 
-1. Download the latest release from the [Releases](https://github.com/yourusername/sharkord-iptv/releases) page.
+1. Download the latest release from the [Releases](/sharkord-iptv/releases) page.
 2. Move the `sharkord-iptv` folder to your Sharkord plugins directory, typically located at `~/.config/sharkord/plugins`.
 3. Download and place the ffmpeg binary (`ffmpeg`for UNIX and `ffmpeg.exe`for Windows) in the `bin` folder inside the `sharkord-iptv` plugin directory. For the best results, use the latest version of ffmpeg.
 4. Make sure the ffmpeg binary has execution permissions (on UNIX systems, you can run `chmod +x ./ffmpeg` in the terminal).
