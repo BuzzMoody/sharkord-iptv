@@ -39,28 +39,23 @@ const spawnFFmpeg = async (
   const binaryPath = getBinaryPath();
   options.log(`Binary path: ${binaryPath}`);
 
-  // Safely encode the messy IPTV URL so it doesn't break the RTSP link
-  const encodedUrl = encodeURIComponent(options.sourceUrl);
+  options.log(`Pulling directly from Dispatcharr: ${options.sourceUrl}`);
 
-  // Generate a random stream ID to prevent collisions if multiple streams start
-  const streamId = Math.random().toString(36).substring(2, 8);
-
-  // --- IMPORTANT: CHANGE THIS TO YOUR MEDIAMTX SERVER'S IP ---
-  const base64Url = Buffer.from(options.sourceUrl).toString('base64');
-
-  const MEDIA_MTX_IP = "192.168.50.198"; 
-  const middlemanUrl = `rtsp://${MEDIA_MTX_IP}:8554/iptv/${base64Url}`;
-
-  options.log(`Requesting GPU stream from Middleman: ${middlemanUrl}`);
-
-  // Stream VIDEO directly to RTP (Zero CPU, instant load)
-  const videoRtpArgs = [
+  // Shared input args - pull directly from Dispatcharr which handles VAAPI transcoding
+  const sharedInputArgs = [
+    "-fflags", "+discardcorrupt+genpts+igndts",
+    "-err_detect", "ignore_err",
+    "-analyzeduration", "5000000",
+    "-probesize", "5000000",
     "-re",
-    "-rtsp_transport", "tcp", // Crucial for stable RTSP ingest
-    "-i", middlemanUrl,
+    "-i", options.sourceUrl,
+  ];
+
+  // Stream VIDEO directly to RTP - Dispatcharr already transcoded, just copy
+  const videoRtpArgs = [
+    ...sharedInputArgs,
     "-map", "0:v:0",
     "-an",
-    // NEVER transcode here, just copy the GPU's hard work
     "-c:v", "copy",
     "-payload_type", options.videoPayloadType.toString(),
     "-ssrc", options.videoSsrc.toString(),
@@ -69,7 +64,7 @@ const spawnFFmpeg = async (
   ];
 
   options.log("Starting video RTP stream...");
-  
+
   const videoRtpProcess = Bun.spawn({
     cmd: [binaryPath, ...videoRtpArgs],
     stdout: "pipe",
@@ -77,15 +72,12 @@ const spawnFFmpeg = async (
     stdin: "ignore",
   });
 
-  // Stream AUDIO directly to RTP
+  // Stream AUDIO directly to RTP - Dispatcharr already transcoded to Opus, just copy
   const audioRtpArgs = [
-    "-re",
-    "-rtsp_transport", "tcp",
-    "-i", middlemanUrl,
+    ...sharedInputArgs,
     "-map", "0:a:0",
     "-vn",
-    // The GPU is already outputting Opus, just copy it!
-    "-c:a", "copy", 
+    "-c:a", "copy",
     "-payload_type", options.audioPayloadType.toString(),
     "-ssrc", options.audioSsrc.toString(),
     "-f", "rtp",
