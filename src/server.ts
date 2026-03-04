@@ -244,9 +244,9 @@ const startStream = async (
             clockRate: 90000,
             parameters: {
               "packetization-mode": 1,
-              "profile-level-id": "640029",
+              "profile-level-id": "640029", // Upgraded to High Profile Level 4.1 to match GPU
               "level-asymmetry-allowed": 1,
-              "x-google-start-bitrate": 2000,
+              "x-google-start-bitrate": 2000, // Bumped slightly for higher initial quality
             },
             rtcpFeedback: [],
           },

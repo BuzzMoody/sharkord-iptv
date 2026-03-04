@@ -1,10 +1,6 @@
 import path from "path";
-import fs from "fs";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
-
-// a lot of vibes going on this file
-// i don't even know if this is efficient or the best way to do this, but it's kinda working
 
 type TOptions = {
   sourceUrl: string;
@@ -22,7 +18,6 @@ type TOptions = {
 };
 
 type TProcessPair = {
-  hls?: ReturnType<typeof Bun.spawn>;
   videoRtp?: ReturnType<typeof Bun.spawn> | null;
   audioRtp?: ReturnType<typeof Bun.spawn> | null;
 };
@@ -42,168 +37,37 @@ const spawnFFmpeg = async (
   options: TOptions,
 ): Promise<TProcessPair> => {
   const binaryPath = getBinaryPath();
-
   options.log(`Binary path: ${binaryPath}`);
 
-  const hlsDir = path.join(pluginPath, "hls");
-  const hlsPlaylist = path.join(hlsDir, "stream.m3u8");
+  // Safely encode the messy IPTV URL so it doesn't break the RTSP link
+  const encodedUrl = encodeURIComponent(options.sourceUrl);
 
-  if (fs.existsSync(hlsDir)) {
-    const files = fs.readdirSync(hlsDir);
+  // Generate a random stream ID to prevent collisions if multiple streams start
+  const streamId = Math.random().toString(36).substring(2, 8);
 
-    files.forEach((file) => {
-      fs.unlinkSync(path.join(hlsDir, file));
-    });
-  } else {
-    fs.mkdirSync(hlsDir, { recursive: true });
-  }
+  // --- IMPORTANT: CHANGE THIS TO YOUR MEDIAMTX SERVER'S IP ---
+  const MEDIA_MTX_IP = "127.0.0.1"; 
+  const middlemanUrl = `rtsp://${MEDIA_MTX_IP}:8554/iptv/${streamId}?url=${encodedUrl}`;
 
-  // create HLS buffer from IPTV
-  const hlsArgs = [
-    "-reconnect",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_on_network_error",
-    "1",
-    "-reconnect_delay_max",
-    "5",
-    "-timeout",
-    "10000000",
-    "-user_agent",
-    "VLC/3.0.16 LibVLC/3.0.16",
+  options.log(`Requesting GPU stream from Middleman: ${middlemanUrl}`);
 
-    // Larger buffer to instantly find the video resolution without stalling
-    "-analyzeduration",
-    "15000000",
-    "-probesize",
-    "15000000",
-
-    // Standard flags to fix corrupt packets without dropping timestamps
-    "-fflags",
-    "+genpts+discardcorrupt",
-    "-err_detect",
-    "ignore_err",
-
-    "-i",
-    options.sourceUrl,
-
-    // directly copy the source video to save CPU
-    "-c:v",
-    "copy",
-
-    // audio: convert to clean AAC for the HLS buffer
-    "-c:a",
-    "aac",
-    "-ar",
-    "48000",
-    "-ac",
-    "2",
-    "-b:a",
-    "128k",
-
-    // hls output with bigger buffer
-    "-f",
-    "hls",
-    "-hls_time",
-    "2", // 2 second segments
-    "-hls_list_size",
-    "15", // keep 15 segments (30 seconds buffer)
-    "-hls_flags",
-    "delete_segments+append_list",
-    "-hls_segment_type",
-    "mpegts",
-    "-hls_segment_filename",
-    path.join(hlsDir, "segment_%03d.ts"),
-    "-start_number",
-    "0",
-
-    hlsPlaylist,
-  ];
-
-  options.log("Starting HLS buffer creation...");
-
-  const hlsProcess = Bun.spawn({
-    cmd: [binaryPath, ...hlsArgs],
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-  });
-
-  (async () => {
-    const reader = hlsProcess.stdout.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[HLS stdout]", text.trim());
-      }
-    } catch (error) {
-      options.error("[HLS stdout error]", error);
-    }
-  })();
-
-  // Handle HLS stderr
-  (async () => {
-    const reader = hlsProcess.stderr.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[HLS stderr]", text.trim());
-      }
-    } catch (error) {
-      options.error("[HLS stderr error]", error);
-    }
-  })();
-
-  options.log("Waiting for HLS playlist...");
-
-  // REDUCED BUFFER WAIT: Wait for 2 segments (4s) instead of 4 segments (8s) for faster load
-  await waitForHLS(hlsPlaylist, 2);
-
-  options.log("HLS playlist ready with buffer!");
-
-  // stream VIDEO from hls to rtp
+  // Stream VIDEO directly to RTP (Zero CPU, instant load)
   const videoRtpArgs = [
     "-re",
-    "-live_start_index",
-    "0", // Force RTP to start at the exact beginning of the buffer
-
-    "-i",
-    hlsPlaylist,
-
-    "-map",
-    "0:v:0",
+    "-rtsp_transport", "tcp", // Crucial for stable RTSP ingest
+    "-i", middlemanUrl,
+    "-map", "0:v:0",
     "-an",
-
-    // just copy video - no transcoding needed
-    "-c:v",
-    "copy",
-
-    "-payload_type",
-    options.videoPayloadType.toString(),
-    "-ssrc",
-    options.videoSsrc.toString(),
-    "-f",
-    "rtp",
+    // NEVER transcode here, just copy the GPU's hard work
+    "-c:v", "copy",
+    "-payload_type", options.videoPayloadType.toString(),
+    "-ssrc", options.videoSsrc.toString(),
+    "-f", "rtp",
     `rtp://${options.rtpHost}:${options.videoRtpPort}?pkt_size=1200`,
   ];
 
-  options.log("Starting video RTP stream from HLS...");
-
+  options.log("Starting video RTP stream...");
+  
   const videoRtpProcess = Bun.spawn({
     cmd: [binaryPath, ...videoRtpArgs],
     stdout: "pipe",
@@ -211,40 +75,26 @@ const spawnFFmpeg = async (
     stdin: "ignore",
   });
 
-  // stream AUDIO from hls to rtp
+  // Stream AUDIO directly to RTP
   const audioRtpArgs = [
     "-re",
-    "-live_start_index",
-    "0", // Force RTP to start at the exact beginning of the buffer
-
-    "-i",
-    hlsPlaylist,
-
-    "-map",
-    "0:a:0",
+    "-rtsp_transport", "tcp",
+    "-i", middlemanUrl,
+    "-map", "0:a:0",
     "-vn",
-
-    // transcode AAC back to Opus for WebRTC
-    "-c:a",
-    "libopus",
-    "-ar",
-    "48000",
-    "-ac",
-    "2",
-    "-b:a",
-    "128k",
-
-    "-payload_type",
-    options.audioPayloadType.toString(),
-    "-ssrc",
-    options.audioSsrc.toString(),
-    "-f",
-    "rtp",
+    // Transcode AAC back to Opus for WebRTC
+    "-c:a", "libopus",
+    "-ar", "48000",
+    "-ac", "2",
+    "-b:a", "128k",
+    "-payload_type", options.audioPayloadType.toString(),
+    "-ssrc", options.audioSsrc.toString(),
+    "-f", "rtp",
     `rtp://${options.rtpHost}:${options.audioRtpPort}?pkt_size=1200`,
   ];
 
-  options.log("Starting audio RTP stream from HLS...");
-
+  options.log("Starting audio RTP stream...");
+  
   const audioRtpProcess = Bun.spawn({
     cmd: [binaryPath, ...audioRtpArgs],
     stdout: "pipe",
@@ -252,125 +102,42 @@ const spawnFFmpeg = async (
     stdin: "ignore",
   });
 
-  (async () => {
-    const reader = videoRtpProcess.stdout.getReader();
+  // Helper function to handle logs cleanly
+  const handleStream = async (stream: any, prefix: string, isError: boolean) => {
+    const reader = stream.getReader();
     const decoder = new TextDecoder();
-
     try {
       while (true) {
         const { done, value } = await reader.read();
-
         if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Video RTP stdout]", text.trim());
+        const text = decoder.decode(value, { stream: true }).trim();
+        if (text) {
+          if (isError) options.log(`[${prefix}]`, text); // Logging all as standard output to prevent spam, can change to options.error if needed
+          else options.log(`[${prefix}]`, text);
+        }
       }
-    } catch (error) {
-      options.error("[Video RTP stdout error]", error);
+    } catch (err) {
+      options.error(`[${prefix} reader error]`, err);
     }
-  })();
+  };
 
-  (async () => {
-    const reader = videoRtpProcess.stderr.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Video RTP stderr]", text.trim());
-      }
-    } catch (error) {
-      options.error("[Video RTP stderr error]", error);
-    }
-  })();
-
-  (async () => {
-    const reader = audioRtpProcess.stdout.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Audio RTP stdout]", text.trim());
-      }
-    } catch (error) {
-      options.error("[Audio RTP stdout error]", error);
-    }
-  })();
-
-  (async () => {
-    const reader = audioRtpProcess.stderr.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) break;
-
-        const text = decoder.decode(value, { stream: true });
-
-        options.log("[Audio RTP stderr]", text.trim());
-      }
-    } catch (error) {
-      options.error("[Audio RTP stderr error]", error);
-    }
-  })();
+  handleStream(videoRtpProcess.stdout, "Video RTP stdout", false);
+  handleStream(videoRtpProcess.stderr, "Video RTP stderr", true);
+  handleStream(audioRtpProcess.stdout, "Audio RTP stdout", false);
+  handleStream(audioRtpProcess.stderr, "Audio RTP stderr", true);
 
   return {
-    hls: hlsProcess,
     videoRtp: videoRtpProcess,
     audioRtp: audioRtpProcess,
   };
-};
-
-const waitForHLS = async (
-  playlistPath: string,
-  minSegments: number = 4,
-  timeout: number = 30000,
-): Promise<void> => {
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeout) {
-    if (fs.existsSync(playlistPath)) {
-      const content = fs.readFileSync(playlistPath, "utf8");
-      const segmentCount = (content.match(/\.ts/g) || []).length;
-
-      if (segmentCount >= minSegments) {
-        await Bun.sleep(2000);
-
-        return;
-      }
-    }
-
-    await Bun.sleep(500);
-  }
-
-  throw new Error("HLS playlist not created within timeout");
 };
 
 const killFFmpegProcesses = (processes: TProcessPair): void => {
   if (processes.videoRtp) {
     processes.videoRtp.kill();
   }
-
   if (processes.audioRtp) {
     processes.audioRtp.kill();
-  }
-
-  if (processes.hls) {
-    processes.hls.kill();
   }
 };
 
