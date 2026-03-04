@@ -30,13 +30,11 @@ type TProcessPair = {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const getBinaryPath = (): string => {
-  let binaryName = "ffmpeg.exe";
-
-  if (process.platform !== "win32") {
-    binaryName = "ffmpeg";
+  // Always use the system-installed ffmpeg
+  if (process.platform === "win32") {
+    return "ffmpeg.exe"; 
   }
-
-  return path.join(__dirname, "bin", binaryName);
+  return "ffmpeg";
 };
 
 const spawnFFmpeg = async (
