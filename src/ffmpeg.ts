@@ -32,7 +32,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const getBinaryPath = (): string => {
   // Always use the system-installed ffmpeg
   if (process.platform === "win32") {
-    return "ffmpeg.exe"; 
+    return "ffmpeg.exe";
   }
   return "ffmpeg";
 };
@@ -71,7 +71,7 @@ const spawnFFmpeg = async (
     "-timeout",
     "10000000",
     "-user_agent",
-    "Mozilla/5.0",
+    "VLC/3.0.16 LibVLC/3.0.16",
 
     "-fflags",
     "+genpts+discardcorrupt",
@@ -85,7 +85,7 @@ const spawnFFmpeg = async (
     "-vf",
     "yadif=0:-1:0",
 
-    // transcode to H264 baseline here (do it once)
+    // transcode to H264 high here (do it once)
     "-c:v",
     "libx264",
     "-preset",
@@ -114,9 +114,9 @@ const spawnFFmpeg = async (
     "-r",
     "25",
 
-    // audio: convert to opus
+    // audio: convert to AAC for the HLS buffer
     "-c:a",
-    "libopus",
+    "aac",
     "-ar",
     "48000",
     "-ac",
@@ -200,8 +200,6 @@ const spawnFFmpeg = async (
   // stream VIDEO from hls to rtp
   const videoRtpArgs = [
     "-re",
-    "-stream_loop",
-    "-1",
 
     "-i",
     hlsPlaylist,
@@ -235,8 +233,6 @@ const spawnFFmpeg = async (
   // stream AUDIO from hls to rtp
   const audioRtpArgs = [
     "-re",
-    "-stream_loop",
-    "-1",
 
     "-i",
     hlsPlaylist,
@@ -245,9 +241,15 @@ const spawnFFmpeg = async (
     "0:a:0",
     "-vn",
 
-    // just copy audio - already opus
+    // transcode AAC back to Opus for WebRTC
     "-c:a",
-    "copy",
+    "libopus",
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
+    "-b:a",
+    "128k",
 
     "-payload_type",
     options.audioPayloadType.toString(),
