@@ -84,11 +84,8 @@ const spawnFFmpeg = async (
     "-i", middlemanUrl,
     "-map", "0:a:0",
     "-vn",
-    // Transcode AAC back to Opus for WebRTC
-    "-c:a", "libopus",
-    "-ar", "48000",
-    "-ac", "2",
-    "-b:a", "128k",
+    // The GPU is already outputting Opus, just copy it!
+    "-c:a", "copy", 
     "-payload_type", options.audioPayloadType.toString(),
     "-ssrc", options.audioSsrc.toString(),
     "-f", "rtp",
