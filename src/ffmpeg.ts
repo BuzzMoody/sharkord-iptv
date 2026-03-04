@@ -74,15 +74,16 @@ const spawnFFmpeg = async (
     "VLC/3.0.16 LibVLC/3.0.16",
 
     "-fflags",
-    "+genpts+discardcorrupt",
+    "+genpts+discardcorrupt+igndts", 
     "-err_detect",
     "ignore_err",
-    
+
+    // Larger buffer to instantly find the video resolution
     "-analyzeduration",
     "15000000",
     "-probesize",
     "15000000",
-    
+
     "-i",
     options.sourceUrl,
 
@@ -122,11 +123,6 @@ const spawnFFmpeg = async (
     // audio: convert to AAC for the HLS buffer
     "-c:a",
     "aac",
-    
-    // This filter dynamically stretches/squeezes audio to perfectly match video frames
-    "-af",
-    "aresample=async=1",
-    
     "-ar",
     "48000",
     "-ac",
