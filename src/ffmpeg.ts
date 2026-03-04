@@ -85,7 +85,7 @@ const spawnFFmpeg = async (
 
     // deinterlace here to avoid doing it twice
     "-vf",
-    "yadif=1:-1:0",
+    "yadif=0:-1:0",
 
     // transcode to H264 baseline here (do it once)
     "-c:v",
@@ -95,19 +95,19 @@ const spawnFFmpeg = async (
     "-tune",
     "zerolatency",
     "-profile:v",
-    "baseline",
+    "high",
     "-level",
-    "3.1",
+    "4.1",
     "-pix_fmt",
     "yuv420p",
 
     // moderate bitrate
     "-b:v",
-    "2500k",
+    "4000k",
     "-maxrate",
-    "3000k",
+    "4500k",
     "-bufsize",
-    "6000k",
+    "8000k",
 
     "-g",
     "50",
