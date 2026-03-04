@@ -9,20 +9,12 @@ import type {
 } from "@sharkord/plugin-sdk";
 import Fuse from "fuse.js";
 import { parse, type Playlist, type PlaylistItem } from "iptv-playlist-parser";
-import {
-  killFFmpegProcesses,
-  probeStream,
-  spawnFFmpeg,
-  type TProcessPair,
-  type TStreamInfo,
-} from "./ffmpeg";
+import { killFFmpegProcesses, spawnFFmpeg, type TProcessPair } from "./ffmpeg";
 import {
   zPlayStreamCommand,
   zStartStreamCommand,
-  zQualityCommand,
   type TPlayStreamCommand,
   type TStartStreamCommand,
-  type TQualityCommand,
 } from "./types";
 
 type TStreamState = {
@@ -42,6 +34,7 @@ const streamStates = new Map<number, TStreamState>();
 
 const getStreamState = (channelId: number): TStreamState => {
   const existing = streamStates.get(channelId);
+
   if (existing) return existing;
 
   const state: TStreamState = {
@@ -58,17 +51,21 @@ const getStreamState = (channelId: number): TStreamState => {
   };
 
   streamStates.set(channelId, state);
+
   return state;
 };
 
 const cleanupChannel = (channelId: number) => {
   const state = streamStates.get(channelId);
-  if (!state || state.isCleaning) return;
+
+  if (!state) return;
+  if (state.isCleaning) return;
 
   state.isCleaning = true;
 
   try {
     killFFmpegProcesses(state.processes);
+
     state.processes = {};
 
     state.streamHandle?.remove?.();
@@ -86,6 +83,7 @@ const cleanupChannel = (channelId: number) => {
 
     if (state.intervalId) {
       clearInterval(state.intervalId);
+
       state.intervalId = null;
     }
 
@@ -93,6 +91,7 @@ const cleanupChannel = (channelId: number) => {
     state.streamStarting = false;
   } finally {
     state.isCleaning = false;
+
     streamStates.delete(channelId);
   }
 };
@@ -157,7 +156,9 @@ const loadPlaylist = (rawPlaylist: string): Playlist => {
 
 const findClosestChannel = (query: string): PlaylistItem | null => {
   if (!playlistCache.parsed || !playlistCache.fuse) return null;
+
   const results = playlistCache.fuse.search(query, { limit: 1 });
+
   return results[0]?.item ?? null;
 };
 
@@ -176,14 +177,19 @@ const startStream = async (
   const state = getStreamState(channelId);
 
   if (state.streamActive) {
-    throw new Error("A stream is already active. Stop it before starting a new one.");
+    throw new Error(
+      "A stream is already active. Stop it before starting a new one.",
+    );
   }
 
   if (state.streamStarting) {
     throw new Error("A stream is already starting. Please wait.");
   }
 
+  ctx.log("Voice runtime initialized in IPTV plugin");
+
   const router = ctx.actions.voice.getRouter(channelId);
+
   if (!router) {
     ctx.log("No router found for channel:", channelId);
     return;
@@ -192,10 +198,8 @@ const startStream = async (
   state.streamStarting = true;
 
   try {
-    // ── 1. PROBE the stream so we know exactly what we're dealing with ────────
-    const streamInfo = await probeStream(sourceUrl, (...m) => ctx.log("[Probe]", ...m));
-
     const { announcedAddress, ip } = await ctx.actions.voice.getListenInfo();
+
     ctx.log("Listen Info:", { announcedAddress, ip });
 
     addOnceListener(router, "@close", () => {
@@ -203,48 +207,51 @@ const startStream = async (
       cleanupChannel(channelId);
     });
 
-    const videoSsrc = 11111111;
+    const ssrc = 11111111;
     const audioSsrc = 22222222;
-    const videoPayloadType = 102;
-    const audioPayloadType = 111;
 
-    // ── 2. Create transports (both using listenInfo + rtcpMux: false) ─────────
     state.videoTransport = await router.createPlainTransport({
-      listenInfo: { ip, protocol: "udp", announcedAddress },
+      listenInfo: {
+        ip,
+        protocol: "udp",
+        announcedAddress: announcedAddress,
+      },
       rtcpMux: false,
       comedia: true,
       enableSrtp: false,
     });
 
     state.audioTransport = await router.createPlainTransport({
-      listenInfo: { ip, protocol: "udp", announcedAddress },
-      rtcpMux: false,
+      listenIp: {
+        ip,
+        announcedIp: announcedAddress,
+      },
+      rtcpMux: true,
       comedia: true,
       enableSrtp: false,
     });
 
-    ctx.log("Video RTP port:", state.videoTransport.tuple.localPort);
-    ctx.log("Audio RTP port:", state.audioTransport.tuple.localPort);
+    ctx.log("Video RTP ingest on port", state.videoTransport.tuple.localPort);
+    ctx.log("Audio RTP ingest on port", state.audioTransport.tuple.localPort);
 
-    // ── 3. Create producers with parameters that MATCH what FFmpeg will send ──
-    // profile-level-id comes from the probe so it matches the actual stream
     state.videoProducer = await state.videoTransport.produce({
       kind: "video",
       rtpParameters: {
         codecs: [
           {
             mimeType: "video/H264",
-            payloadType: videoPayloadType,
+            payloadType: 102,
             clockRate: 90000,
             parameters: {
               "packetization-mode": 1,
-              "profile-level-id": streamInfo.profileLevelId,
+              "profile-level-id": "42e01f",
               "level-asymmetry-allowed": 1,
+              "x-google-start-bitrate": 1000,
             },
             rtcpFeedback: [],
           },
         ],
-        encodings: [{ ssrc: videoSsrc }],
+        encodings: [{ ssrc: ssrc }],
       },
     });
 
@@ -254,10 +261,10 @@ const startStream = async (
         codecs: [
           {
             mimeType: "audio/opus",
-            payloadType: audioPayloadType,
+            payloadType: 111,
             clockRate: 48000,
             channels: 2,
-            parameters: { "sprop-stereo": 1 },
+            parameters: {},
             rtcpFeedback: [],
           },
         ],
@@ -267,7 +274,7 @@ const startStream = async (
 
     state.streamHandle = ctx.actions.voice.createStream({
       key: "stream",
-      channelId,
+      channelId: channelId,
       title: streamName ?? "IPTV",
       avatarUrl: streamImageUrl ?? "https://i.imgur.com/ozINkq3.jpeg",
       producers: {
@@ -276,48 +283,65 @@ const startStream = async (
       },
     });
 
-    addOnceListener(state.videoProducer?.observer, "close", () => {
-      ctx.log("IPTV video producer closed");
+    const videoProducer = state.videoProducer;
+    const audioProducer = state.audioProducer;
+
+    addOnceListener(videoProducer?.observer, "close", () => {
+      ctx.log("IPTV video producer closed:", videoProducer.id);
       cleanupChannel(channelId);
     });
 
-    addOnceListener(state.audioProducer?.observer, "close", () => {
-      ctx.log("IPTV audio producer closed");
+    addOnceListener(audioProducer?.observer, "close", () => {
+      ctx.log("IPTV audio producer closed:", audioProducer.id);
       cleanupChannel(channelId);
     });
 
-    // ── 4. Spawn FFmpeg with full knowledge of the stream ─────────────────────
     try {
-      state.processes = spawnFFmpeg({
+      state.processes = await spawnFFmpeg(ctx.path, {
         sourceUrl,
-        streamInfo,
-        videoPayloadType,
-        audioPayloadType,
-        videoSsrc,
-        audioSsrc,
+        gopSize: 30,
+        videoPayloadType: 102,
+        audioPayloadType: 111,
+        videoSsrc: ssrc,
+        audioSsrc: audioSsrc,
         rtpHost: ip,
         videoRtpPort: state.videoTransport.tuple.localPort,
         audioRtpPort: state.audioTransport.tuple.localPort,
-        log: (...messages) => ctx.debug("[FFmpeg]", ...messages),
-        error: (...messages) => ctx.error("[FFmpeg]", ...messages),
+        packetSize: 1200,
+        log: (...messages: unknown[]) => {
+          ctx.debug("[FFmpeg]", ...messages);
+        },
+        error: (...messages: unknown[]) => {
+          ctx.error("[FFmpeg]", ...messages);
+        },
       });
     } catch (error) {
       cleanupChannel(channelId);
+
       throw error;
     }
 
     state.streamActive = true;
-    ctx.log(`Stream started: ${streamName ?? sourceUrl} (${streamInfo.videoCodec} ${streamInfo.width}x${streamInfo.height}@${streamInfo.fps}fps, audio: ${streamInfo.audioCodec})`);
   } finally {
-    const s = streamStates.get(channelId);
-    if (s) s.streamStarting = false;
+    const state = streamStates.get(channelId);
+
+    if (state) {
+      state.streamStarting = false;
+    }
   }
 };
 
 const addOnceListener = (target: any, event: string, handler: () => void) => {
   if (!target) return;
-  if (typeof target.once === "function") { target.once(event, handler); return; }
-  if (typeof target.on === "function") { target.on(event, handler); }
+
+  if (typeof target.once === "function") {
+    target.once(event, handler);
+    return;
+  }
+
+  if (typeof target.on === "function") {
+    target.on(event, handler);
+  }
 };
 
 const onLoad = async (ctx: PluginContext) => {
@@ -333,11 +357,13 @@ const onLoad = async (ctx: PluginContext) => {
 
   ctx.commands.register<TStartStreamCommand>({
     name: "iptv_play_direct",
-    description: "Start an IPTV stream from a direct URL",
+    description:
+      "Start an IPTV stream in the specified channel from a direct URL",
     args: [
       {
         name: "sourceUrl",
-        description: "Direct link to a media stream",
+        description:
+          "The source URL of the stream. Note that this must be a direct link to a media stream, not a playlist.",
         type: "string",
         required: true,
         sensitive: true,
@@ -350,14 +376,18 @@ const onLoad = async (ctx: PluginContext) => {
       },
     ],
     executes: async (invoker, input) => {
+      console.log(JSON.stringify({ invoker, input }, null, 2));
+
       const { sourceUrl, streamName } = zStartStreamCommand.parse(input);
+
       await startStream(ctx, invoker, sourceUrl, streamName);
     },
   });
 
   ctx.commands.register<TPlayStreamCommand>({
     name: "iptv_play",
-    description: "Start an IPTV stream from the playlist",
+    description:
+      "Start an IPTV stream in the specified channel from the playlist",
     args: [
       {
         name: "channelName",
@@ -367,6 +397,8 @@ const onLoad = async (ctx: PluginContext) => {
       },
     ],
     executes: async (invoker, input) => {
+      console.log(JSON.stringify({ invoker, input }, null, 2));
+
       const { channelName } = zPlayStreamCommand.parse(input);
       const rawPlaylist = settings.get("playlist").trim();
 
@@ -380,17 +412,20 @@ const onLoad = async (ctx: PluginContext) => {
       ctx.log('Found channel match for "', channelName, '":', item?.name);
 
       if (!item?.url) {
-        throw new Error(`No channel match found for "${channelName}" in the playlist.`);
+        throw new Error(
+          `No channel match found for "${channelName}" in the playlist.`,
+        );
       }
 
       const displayName = item.name || item.tvg?.name || channelName;
+
       await startStream(ctx, invoker, item.url, displayName, item.tvg?.logo);
     },
   });
 
   ctx.commands.register({
     name: "iptv_stop",
-    description: "Stop the IPTV stream in the current channel",
+    description: "Stop the IPTV stream in the specified channel",
     executes: async (invoker) => {
       if (invoker.currentVoiceChannelId === undefined) {
         throw new Error("You must be in a voice channel to stop a stream.");
@@ -404,25 +439,29 @@ const onLoad = async (ctx: PluginContext) => {
         return;
       }
 
+      ctx.log("Stopping IPTV stream");
+
       cleanupChannel(channelId);
-      ctx.log("IPTV stream stopped.");
+
+      ctx.log("IPTV stream stopped");
     },
   });
 
   ctx.commands.register({
     name: "iptv_clean",
-    description: "Forcefully clean up the stream in this channel",
+    description: "Forcefully cleans up the active stream in this channel",
     executes: async (invoker) => {
       if (invoker.currentVoiceChannelId === undefined) {
-        throw new Error("You must be in a voice channel.");
+        throw new Error("You must be in a voice channel to clean a stream.");
       }
+
       cleanupChannel(invoker.currentVoiceChannelId);
     },
   });
 
   ctx.commands.register({
     name: "iptv_cleanall",
-    description: "Forcefully clean up all active streams",
+    description: "Forcefully cleans up all active streams and processes",
     executes: async () => {
       cleanupAll();
     },
@@ -431,6 +470,7 @@ const onLoad = async (ctx: PluginContext) => {
 
 const onUnload = (ctx: PluginContext) => {
   cleanupAll();
+
   ctx.log("IPTV Plugin unloaded");
 };
 

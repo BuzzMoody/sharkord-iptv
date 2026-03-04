@@ -1,29 +1,14 @@
 import path from "path";
+import fs from "fs";
 import { dirname } from "path";
 import { fileURLToPath } from "url";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+// a lot of vibes going on this file
+// i don't even know if this is efficient or the best way to do this, but it's kinda working
 
-export type TStreamInfo = {
-  videoCodec: string;       // e.g. "h264"
-  audioCodec: string;       // e.g. "ac3", "aac", "mp2"
-  width: number;
-  height: number;
-  fps: number;
-  profileLevelId: string;   // hex string for mediasoup, e.g. "640032"
-  isH264: boolean;
-  needsVideoTranscode: boolean;
-  needsAudioTranscode: boolean; // always true — we always output opus for mediasoup
-};
-
-export type TProcessPair = {
-  videoRtp?: ReturnType<typeof Bun.spawn> | null;
-  audioRtp?: ReturnType<typeof Bun.spawn> | null;
-};
-
-export type TSpawnOptions = {
+type TOptions = {
   sourceUrl: string;
-  streamInfo: TStreamInfo;
+  gopSize: number;
   videoPayloadType: number;
   audioPayloadType: number;
   videoSsrc: number;
@@ -31,261 +16,380 @@ export type TSpawnOptions = {
   rtpHost: string;
   videoRtpPort: number;
   audioRtpPort: number;
+  packetSize: number;
   log: (...messages: unknown[]) => void;
   error: (...messages: unknown[]) => void;
 };
 
-const getFFmpegBin = (): string => {
-  try {
-    const proc = Bun.spawnSync(["ffmpeg", "-version"]);
-    if (proc.success) return "ffmpeg";
-  } catch {}
-
-  const name = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
-  return path.join(__dirname, "bin", name);
+type TProcessPair = {
+  hls?: ReturnType<typeof Bun.spawn>;
+  videoRtp?: ReturnType<typeof Bun.spawn> | null;
+  audioRtp?: ReturnType<typeof Bun.spawn> | null;
 };
 
-const getFFprobeBin = (): string => {
-  try {
-    const proc = Bun.spawnSync(["ffprobe", "-version"]);
-    if (proc.success) return "ffprobe";
-  } catch {}
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
-  const name = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
-  return path.join(__dirname, "bin", name);
-};
+const getBinaryPath = (): string => {
+  let binaryName = "ffmpeg.exe";
 
-// Convert H264 profile + level integers to the 3-byte hex profile-level-id
-// that mediasoup/SDP expects (e.g. "640032" = High 5.0)
-const buildProfileLevelId = (profile: number, level: number): string => {
-  // constraint_set flags byte — 0x00 for High, 0x40 for Baseline constrained
-  const constraints = profile === 66 ? 0xe0 : 0x00;
-  return [profile, constraints, level]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-};
-
-// Run ffprobe on the source and return everything mediasoup needs to know
-export const probeStream = async (
-  sourceUrl: string,
-  log: (...messages: unknown[]) => void,
-): Promise<TStreamInfo> => {
-  const ffprobe = getFFprobeBin();
-
-  log("Probing stream:", sourceUrl);
-
-  const proc = Bun.spawnSync([
-    ffprobe,
-    "-v", "quiet",
-    "-print_format", "json",
-    "-show_streams",
-    "-show_format",
-    "-user_agent", "Mozilla/5.0",
-    "-timeout", "10000000",
-    sourceUrl,
-  ]);
-
-  const raw = proc.stdout.toString();
-  const data = JSON.parse(raw);
-  const streams: any[] = data.streams ?? [];
-
-  const videoStream = streams.find((s) => s.codec_type === "video");
-  const audioStream = streams.find((s) => s.codec_type === "audio");
-
-  if (!videoStream) throw new Error("No video stream found in source");
-  if (!audioStream) throw new Error("No audio stream found in source");
-
-  const videoCodec = videoStream.codec_name ?? "unknown";
-  const audioCodec = audioStream.codec_name ?? "unknown";
-
-  // Parse fps from r_frame_rate (e.g. "50/1") or avg_frame_rate
-  const fpsStr = videoStream.r_frame_rate ?? videoStream.avg_frame_rate ?? "25/1";
-  const [num, den] = fpsStr.split("/").map(Number);
-  const fps = den > 0 ? Math.round((num / den) * 100) / 100 : 25;
-
-  const width = videoStream.width ?? 1920;
-  const height = videoStream.height ?? 1080;
-  const isH264 = videoCodec === "h264";
-
-  // Build profile-level-id from ffprobe data if available, else use sane defaults
-  let profileLevelId = "42e01f"; // Baseline 3.1 fallback
-  if (isH264) {
-    const profileStr = (videoStream.profile ?? "").toLowerCase();
-    const level = Math.round((videoStream.level ?? 31));
-
-    let profileByte = 0x42; // Baseline
-    if (profileStr.includes("high")) profileByte = 0x64;
-    else if (profileStr.includes("main")) profileByte = 0x4d;
-
-    profileLevelId = buildProfileLevelId(profileByte, level);
+  if (process.platform !== "win32") {
+    binaryName = "ffmpeg";
   }
 
-  // We can copy H264 video directly into RTP — no re-encode needed
-  // Any other codec needs transcoding to H264
-  const needsVideoTranscode = !isH264;
-
-  // Audio always gets transcoded to Opus for mediasoup
-  const needsAudioTranscode = true;
-
-  log(`Probe result: ${videoCodec} ${width}x${height} @ ${fps}fps, audio: ${audioCodec}`);
-  log(`Profile-level-id: ${profileLevelId}, needsVideoTranscode: ${needsVideoTranscode}`);
-
-  return {
-    videoCodec,
-    audioCodec,
-    width,
-    height,
-    fps,
-    profileLevelId,
-    isH264,
-    needsVideoTranscode,
-    needsAudioTranscode,
-  };
+  return path.join(__dirname, "bin", binaryName);
 };
 
-// Pipe stderr/stdout of a spawned process to the log functions
-const pipeOutput = (
-  proc: ReturnType<typeof Bun.spawn>,
-  label: string,
-  log: (...m: unknown[]) => void,
-  error: (...m: unknown[]) => void,
-) => {
-  (async () => {
-    const reader = proc.stdout.getReader();
-    const dec = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const t = dec.decode(value, { stream: true }).trim();
-        if (t) log(`[${label} stdout]`, t);
-      }
-    } catch (e) { error(`[${label} stdout error]`, e); }
-  })();
+const spawnFFmpeg = async (
+  pluginPath: string,
+  options: TOptions,
+): Promise<TProcessPair> => {
+  const binaryPath = getBinaryPath();
 
-  (async () => {
-    const reader = proc.stderr.getReader();
-    const dec = new TextDecoder();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const t = dec.decode(value, { stream: true }).trim();
-        if (t) log(`[${label} stderr]`, t);
-      }
-    } catch (e) { error(`[${label} stderr error]`, e); }
-  })();
-};
+  options.log(`Binary path: ${binaryPath}`);
 
-export const spawnFFmpeg = (options: TSpawnOptions): TProcessPair => {
-  const ffmpeg = getFFmpegBin();
-  const { streamInfo } = options;
+  const hlsDir = path.join(pluginPath, "hls");
+  const hlsPlaylist = path.join(hlsDir, "stream.m3u8");
 
-  const env = {
-    ...process.env,
-    LIBVA_DRIVER_NAME: "iHD",
-    LIBVA_DRIVERS_PATH: "/usr/lib/x86_64-linux-gnu/dri",
-  };
+  if (fs.existsSync(hlsDir)) {
+    const files = fs.readdirSync(hlsDir);
 
-  // Common input args for both processes
-  const inputArgs = [
-    "-reconnect", "1",
-    "-reconnect_streamed", "1",
-    "-reconnect_on_network_error", "1",
-    "-reconnect_delay_max", "5",
-    "-timeout", "10000000",
-    "-user_agent", "Mozilla/5.0",
-    "-fflags", "+genpts+discardcorrupt",
-    "-err_detect", "ignore_err",
+    files.forEach((file) => {
+      fs.unlinkSync(path.join(hlsDir, file));
+    });
+  } else {
+    fs.mkdirSync(hlsDir, { recursive: true });
+  }
+
+  // create HLS buffer from IPTV
+  const hlsArgs = [
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_on_network_error",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-timeout",
+    "10000000",
+    "-user_agent",
+    "Mozilla/5.0",
+
+    "-fflags",
+    "+genpts+discardcorrupt",
+    "-err_detect",
+    "ignore_err",
+
+    "-i",
+    options.sourceUrl,
+
+    // deinterlace here to avoid doing it twice
+    "-vf",
+    "yadif=1:-1:0",
+
+    // transcode to H264 baseline here (do it once)
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-tune",
+    "zerolatency",
+    "-profile:v",
+    "baseline",
+    "-level",
+    "3.1",
+    "-pix_fmt",
+    "yuv420p",
+
+    // moderate bitrate
+    "-b:v",
+    "2500k",
+    "-maxrate",
+    "3000k",
+    "-bufsize",
+    "6000k",
+
+    "-g",
+    "50",
+    "-sc_threshold",
+    "0",
+    "-r",
+    "25",
+
+    // audio: convert to opus
+    "-c:a",
+    "libopus",
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
+    "-b:a",
+    "128k",
+
+    // hls output with bigger buffer
+    "-f",
+    "hls",
+    "-hls_time",
+    "2", // 2 second segments
+    "-hls_list_size",
+    "15", // keep 15 segments (30 seconds buffer)
+    "-hls_flags",
+    "delete_segments+append_list",
+    "-hls_segment_type",
+    "mpegts",
+    "-hls_segment_filename",
+    path.join(hlsDir, "segment_%03d.ts"),
+    "-start_number",
+    "0",
+
+    hlsPlaylist,
   ];
 
-  // ── VIDEO ──────────────────────────────────────────────────────────────────
-  // If the source is already H264, copy it straight into RTP — zero re-encode.
-  // If it's something else (HEVC, MPEG2, etc), transcode to H264 via CPU.
-  // We deliberately avoid VAAPI here: the virtual iGPU in Proxmox cannot keep
-  // up with 50fps 1080p re-encoding due to DMA upload latency.
-  const videoEncodeArgs = streamInfo.needsVideoTranscode
-    ? [
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-profile:v", "baseline",
-        "-level", "3.1",
-        "-pix_fmt", "yuv420p",
-        "-b:v", "2500k",
-        "-maxrate", "3000k",
-        "-bufsize", "6000k",
-      ]
-    : ["-c:v", "copy"];
+  options.log("Starting HLS buffer creation...");
 
+  const hlsProcess = Bun.spawn({
+    cmd: [binaryPath, ...hlsArgs],
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+  });
+
+  (async () => {
+    const reader = hlsProcess.stdout.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        const text = decoder.decode(value, { stream: true });
+
+        options.log("[HLS stdout]", text.trim());
+      }
+    } catch (error) {
+      options.error("[HLS stdout error]", error);
+    }
+  })();
+
+  // Handle HLS stderr
+  (async () => {
+    const reader = hlsProcess.stderr.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        const text = decoder.decode(value, { stream: true });
+
+        options.log("[HLS stderr]", text.trim());
+      }
+    } catch (error) {
+      options.error("[HLS stderr error]", error);
+    }
+  })();
+
+  options.log("Waiting for HLS playlist...");
+
+  await waitForHLS(hlsPlaylist, 4); // wait for 4 segments (8 seconds)
+
+  options.log("HLS playlist ready with buffer!");
+
+  // stream VIDEO from hls to rtp
   const videoRtpArgs = [
-    ...inputArgs,
-    "-i", options.sourceUrl,
-    "-map", "0:v:0",
+    "-re",
+    "-stream_loop",
+    "-1",
+
+    "-i",
+    hlsPlaylist,
+
+    "-map",
+    "0:v:0",
     "-an",
-    ...videoEncodeArgs,
-    "-payload_type", options.videoPayloadType.toString(),
-    "-ssrc", options.videoSsrc.toString(),
-    "-f", "rtp",
+
+    // just copy video - no transcoding needed
+    "-c:v",
+    "copy",
+
+    "-payload_type",
+    options.videoPayloadType.toString(),
+    "-ssrc",
+    options.videoSsrc.toString(),
+    "-f",
+    "rtp",
     `rtp://${options.rtpHost}:${options.videoRtpPort}?pkt_size=1200`,
   ];
 
-  // ── AUDIO ──────────────────────────────────────────────────────────────────
-  // Always transcode to Opus — mediasoup requires it.
-  // Detect channel layout and downmix surround to stereo if needed.
-  const channels = 2; // always output stereo
-  const audioFilterArgs = streamInfo.audioCodec === "ac3" || streamInfo.audioCodec === "eac3"
-    ? ["-af", "pan=stereo|FL=0.5*FC+0.707*FL+0.707*BL+0.5*LFE|FR=0.5*FC+0.707*FR+0.707*BR+0.5*LFE,asetpts=N/SR/TB"]
-    : ["-af", "aresample=48000,asetpts=N/SR/TB"];
+  options.log("Starting video RTP stream from HLS...");
 
+  const videoRtpProcess = Bun.spawn({
+    cmd: [binaryPath, ...videoRtpArgs],
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+  });
+
+  // stream AUDIO from hls to rtp
   const audioRtpArgs = [
-    ...inputArgs,
-    "-use_wallclock_as_timestamps", "1",
-    "-i", options.sourceUrl,
-    "-map", "0:a:0",
+    "-re",
+    "-stream_loop",
+    "-1",
+
+    "-i",
+    hlsPlaylist,
+
+    "-map",
+    "0:a:0",
     "-vn",
-    ...audioFilterArgs,
-    "-c:a", "libopus",
-    "-ar", "48000",
-    "-ac", channels.toString(),
-    "-b:a", "128k",
-    "-application", "audio",
-    "-vbr", "on",
-    "-frame_duration", "20",
-    "-payload_type", options.audioPayloadType.toString(),
-    "-ssrc", options.audioSsrc.toString(),
-    "-f", "rtp",
+
+    // just copy audio - already opus
+    "-c:a",
+    "copy",
+
+    "-payload_type",
+    options.audioPayloadType.toString(),
+    "-ssrc",
+    options.audioSsrc.toString(),
+    "-f",
+    "rtp",
     `rtp://${options.rtpHost}:${options.audioRtpPort}?pkt_size=1200`,
   ];
 
-  options.log("Starting video RTP process...");
-  options.log("Video args:", [ffmpeg, ...videoRtpArgs].join(" "));
-
-  const videoRtpProcess = Bun.spawn({
-    cmd: [ffmpeg, ...videoRtpArgs],
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-    env,
-  });
-
-  options.log("Starting audio RTP process...");
+  options.log("Starting audio RTP stream from HLS...");
 
   const audioRtpProcess = Bun.spawn({
-    cmd: [ffmpeg, ...audioRtpArgs],
+    cmd: [binaryPath, ...audioRtpArgs],
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
-    env,
   });
 
-  pipeOutput(videoRtpProcess, "Video RTP", options.log, options.error);
-  pipeOutput(audioRtpProcess, "Audio RTP", options.log, options.error);
+  (async () => {
+    const reader = videoRtpProcess.stdout.getReader();
+    const decoder = new TextDecoder();
 
-  return { videoRtp: videoRtpProcess, audioRtp: audioRtpProcess };
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        const text = decoder.decode(value, { stream: true });
+
+        options.log("[Video RTP stdout]", text.trim());
+      }
+    } catch (error) {
+      options.error("[Video RTP stdout error]", error);
+    }
+  })();
+
+  (async () => {
+    const reader = videoRtpProcess.stderr.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        const text = decoder.decode(value, { stream: true });
+
+        options.log("[Video RTP stderr]", text.trim());
+      }
+    } catch (error) {
+      options.error("[Video RTP stderr error]", error);
+    }
+  })();
+
+  (async () => {
+    const reader = audioRtpProcess.stdout.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        const text = decoder.decode(value, { stream: true });
+
+        options.log("[Audio RTP stdout]", text.trim());
+      }
+    } catch (error) {
+      options.error("[Audio RTP stdout error]", error);
+    }
+  })();
+
+  (async () => {
+    const reader = audioRtpProcess.stderr.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        const text = decoder.decode(value, { stream: true });
+
+        options.log("[Audio RTP stderr]", text.trim());
+      }
+    } catch (error) {
+      options.error("[Audio RTP stderr error]", error);
+    }
+  })();
+
+  return {
+    hls: hlsProcess,
+    videoRtp: videoRtpProcess,
+    audioRtp: audioRtpProcess,
+  };
 };
 
-export const killFFmpegProcesses = (processes: TProcessPair): void => {
-  processes.videoRtp?.kill();
-  processes.audioRtp?.kill();
+const waitForHLS = async (
+  playlistPath: string,
+  minSegments: number = 4,
+  timeout: number = 30000,
+): Promise<void> => {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeout) {
+    if (fs.existsSync(playlistPath)) {
+      const content = fs.readFileSync(playlistPath, "utf8");
+      const segmentCount = (content.match(/\.ts/g) || []).length;
+
+      if (segmentCount >= minSegments) {
+        await Bun.sleep(2000);
+
+        return;
+      }
+    }
+
+    await Bun.sleep(500);
+  }
+
+  throw new Error("HLS playlist not created within timeout");
 };
+
+const killFFmpegProcesses = (processes: TProcessPair): void => {
+  if (processes.videoRtp) {
+    processes.videoRtp.kill();
+  }
+
+  if (processes.audioRtp) {
+    processes.audioRtp.kill();
+  }
+
+  if (processes.hls) {
+    processes.hls.kill();
+  }
+};
+
+export { spawnFFmpeg, killFFmpegProcesses };
+export type { TOptions, TProcessPair };

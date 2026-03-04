@@ -12,9 +12,3 @@ export const zPlayStreamCommand = z.object({
 });
 
 export type TPlayStreamCommand = z.infer<typeof zPlayStreamCommand>;
-
-export const zQualityCommand = z.object({
-  level: z.string().min(1),
-});
-
-export type TQualityCommand = z.infer<typeof zQualityCommand>;
