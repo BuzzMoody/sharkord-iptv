@@ -74,20 +74,15 @@ const spawnFFmpeg = async (
     "VLC/3.0.16 LibVLC/3.0.16",
 
     "-fflags",
-    "+genpts+discardcorrupt+igndts", // Added igndts to ignore bad provider timestamps
+    "+genpts+discardcorrupt",
     "-err_detect",
     "ignore_err",
     
-    // Give FFmpeg a larger buffer to instantly find the video resolution
     "-analyzeduration",
     "15000000",
     "-probesize",
     "15000000",
     
-    // Force FFmpeg to use your server's clock for perfect A/V sync
-    "-use_wallclock_as_timestamps",
-    "1",
-
     "-i",
     options.sourceUrl,
 
@@ -215,7 +210,7 @@ const spawnFFmpeg = async (
   // stream VIDEO from hls to rtp
   const videoRtpArgs = [
     "-re",
-
+    "-live_start_index", "0", // Add this line
     "-i",
     hlsPlaylist,
 
@@ -248,7 +243,7 @@ const spawnFFmpeg = async (
   // stream AUDIO from hls to rtp
   const audioRtpArgs = [
     "-re",
-
+    "-live_start_index", "0", // Add this line
     "-i",
     hlsPlaylist,
 
