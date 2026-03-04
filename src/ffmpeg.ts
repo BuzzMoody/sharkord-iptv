@@ -25,7 +25,6 @@ type TProcessPair = {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const getBinaryPath = (): string => {
-  // Always use the system-installed ffmpeg
   if (process.platform === "win32") {
     return "ffmpeg.exe";
   }
@@ -41,42 +40,24 @@ const spawnFFmpeg = async (
 
   options.log(`Pulling directly from Dispatcharr: ${options.sourceUrl}`);
 
-  // Shared input args - pull directly from Dispatcharr which handles VAAPI transcoding
-  const sharedInputArgs = [
+  // Single ffmpeg process for both video and audio
+  // This prevents Dispatcharr from seeing 2 separate stream connections
+  const ffmpegArgs = [
     "-fflags", "+discardcorrupt+genpts+igndts",
     "-err_detect", "ignore_err",
     "-analyzeduration", "5000000",
     "-probesize", "5000000",
     "-re",
     "-i", options.sourceUrl,
-  ];
-
-  // Stream VIDEO directly to RTP - Dispatcharr already transcoded, just copy
-  const videoRtpArgs = [
-    ...sharedInputArgs,
+    // Video output to RTP
     "-map", "0:v:0",
-    "-an",
     "-c:v", "copy",
     "-payload_type", options.videoPayloadType.toString(),
     "-ssrc", options.videoSsrc.toString(),
     "-f", "rtp",
     `rtp://${options.rtpHost}:${options.videoRtpPort}?pkt_size=1200`,
-  ];
-
-  options.log("Starting video RTP stream...");
-
-  const videoRtpProcess = Bun.spawn({
-    cmd: [binaryPath, ...videoRtpArgs],
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-  });
-
-  // Stream AUDIO directly to RTP - Dispatcharr already transcoded to Opus, just copy
-  const audioRtpArgs = [
-    ...sharedInputArgs,
+    // Audio output to RTP
     "-map", "0:a:0",
-    "-vn",
     "-c:a", "copy",
     "-payload_type", options.audioPayloadType.toString(),
     "-ssrc", options.audioSsrc.toString(),
@@ -84,10 +65,10 @@ const spawnFFmpeg = async (
     `rtp://${options.rtpHost}:${options.audioRtpPort}?pkt_size=1200`,
   ];
 
-  options.log("Starting audio RTP stream...");
-  
-  const audioRtpProcess = Bun.spawn({
-    cmd: [binaryPath, ...audioRtpArgs],
+  options.log("Starting combined video+audio RTP stream...");
+
+  const rtpProcess = Bun.spawn({
+    cmd: [binaryPath, ...ffmpegArgs],
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
@@ -103,7 +84,7 @@ const spawnFFmpeg = async (
         if (done) break;
         const text = decoder.decode(value, { stream: true }).trim();
         if (text) {
-          if (isError) options.log(`[${prefix}]`, text); // Logging all as standard output to prevent spam, can change to options.error if needed
+          if (isError) options.log(`[${prefix}]`, text);
           else options.log(`[${prefix}]`, text);
         }
       }
@@ -112,14 +93,12 @@ const spawnFFmpeg = async (
     }
   };
 
-  handleStream(videoRtpProcess.stdout, "Video RTP stdout", false);
-  handleStream(videoRtpProcess.stderr, "Video RTP stderr", true);
-  handleStream(audioRtpProcess.stdout, "Audio RTP stdout", false);
-  handleStream(audioRtpProcess.stderr, "Audio RTP stderr", true);
+  handleStream(rtpProcess.stdout, "RTP stdout", false);
+  handleStream(rtpProcess.stderr, "RTP stderr", true);
 
   return {
-    videoRtp: videoRtpProcess,
-    audioRtp: audioRtpProcess,
+    videoRtp: rtpProcess,
+    audioRtp: null,
   };
 };
 
