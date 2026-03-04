@@ -73,16 +73,17 @@ const spawnFFmpeg = async (
     "-user_agent",
     "VLC/3.0.16 LibVLC/3.0.16",
 
-    "-fflags",
-    "+genpts+discardcorrupt+igndts", 
-    "-err_detect",
-    "ignore_err",
-
-    // Larger buffer to instantly find the video resolution
+    // Larger buffer to instantly find the video resolution without stalling
     "-analyzeduration",
     "15000000",
     "-probesize",
     "15000000",
+
+    // Standard flags to fix corrupt packets without dropping timestamps
+    "-fflags",
+    "+genpts+discardcorrupt",
+    "-err_detect",
+    "ignore_err",
 
     "-i",
     options.sourceUrl,
@@ -120,7 +121,7 @@ const spawnFFmpeg = async (
     "-r",
     "25",
 
-    // audio: convert to AAC for the HLS buffer
+    // audio: convert to clean AAC for the HLS buffer
     "-c:a",
     "aac",
     "-ar",
@@ -199,14 +200,17 @@ const spawnFFmpeg = async (
 
   options.log("Waiting for HLS playlist...");
 
-  await waitForHLS(hlsPlaylist, 4); // wait for 4 segments (8 seconds)
+  // REDUCED BUFFER WAIT: Wait for 2 segments (4s) instead of 4 segments (8s) for faster load
+  await waitForHLS(hlsPlaylist, 2);
 
   options.log("HLS playlist ready with buffer!");
 
   // stream VIDEO from hls to rtp
   const videoRtpArgs = [
     "-re",
-    "-live_start_index", "0", // Add this line
+    "-live_start_index",
+    "0", // Force RTP to start at the exact beginning of the buffer
+
     "-i",
     hlsPlaylist,
 
@@ -239,7 +243,9 @@ const spawnFFmpeg = async (
   // stream AUDIO from hls to rtp
   const audioRtpArgs = [
     "-re",
-    "-live_start_index", "0", // Add this line
+    "-live_start_index",
+    "0", // Force RTP to start at the exact beginning of the buffer
+
     "-i",
     hlsPlaylist,
 
