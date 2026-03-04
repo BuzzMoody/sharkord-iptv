@@ -88,38 +88,9 @@ const spawnFFmpeg = async (
     "-i",
     options.sourceUrl,
 
-    // deinterlace here to avoid doing it twice
-    "-vf",
-    "yadif=0:-1:0",
-
-    // transcode to H264 high here (do it once)
+    // directly copy the source video to save CPU
     "-c:v",
-    "libx264",
-    "-preset",
-    "veryfast",
-    "-tune",
-    "zerolatency",
-    "-profile:v",
-    "high",
-    "-level",
-    "4.1",
-    "-pix_fmt",
-    "yuv420p",
-
-    // moderate bitrate
-    "-b:v",
-    "4000k",
-    "-maxrate",
-    "4500k",
-    "-bufsize",
-    "8000k",
-
-    "-g",
-    "50",
-    "-sc_threshold",
-    "0",
-    "-r",
-    "25",
+    "copy",
 
     // audio: convert to clean AAC for the HLS buffer
     "-c:a",
