@@ -46,8 +46,10 @@ const spawnFFmpeg = async (
   const streamId = Math.random().toString(36).substring(2, 8);
 
   // --- IMPORTANT: CHANGE THIS TO YOUR MEDIAMTX SERVER'S IP ---
+  const base64Url = Buffer.from(options.sourceUrl).toString('base64');
+
   const MEDIA_MTX_IP = "127.0.0.1"; 
-  const middlemanUrl = `rtsp://${MEDIA_MTX_IP}:8554/iptv/${streamId}?url=${encodedUrl}`;
+  const middlemanUrl = `rtsp://${MEDIA_MTX_IP}:8554/iptv/${base64Url}`;
 
   options.log(`Requesting GPU stream from Middleman: ${middlemanUrl}`);
 
